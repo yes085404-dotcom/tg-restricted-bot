@@ -10,6 +10,7 @@ from telethon.errors import (
     AuthKeyUnregisteredError,
     ChannelPrivateError,
     ChatForwardsRestrictedError,
+    FloodWaitError,
     RPCError,
     SessionPasswordNeededError,
 )
@@ -17,6 +18,8 @@ from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
 
 from config import API_HASH, API_ID, DB_PATH, DOWNLOAD_DIR, TG_SESSION
+
+MAX_BATCH_FILES = 10000
 
 ACTIVE_TASKS: Dict[int, Set[asyncio.Task]] = {}
 _CLIENTS: Dict[int, TelegramClient] = {}
@@ -259,7 +262,7 @@ async def _ensure_dialogs_registered(user_id: int, client: TelegramClient) -> No
     if user_id in _DIALOGS_LOADED:
         return
     try:
-        await client.get_dialogs(limit=150)
+        await client.get_dialogs(limit=200)
         _DIALOGS_LOADED.add(user_id)
     except Exception:
         pass
@@ -335,7 +338,7 @@ def _build_message_ids(mode_key: str, raw_input: str, first_id: int) -> List[int
         _, id2, _ = _parse_single_link(part2.strip())
         if id1 and id2:
             start_i, end_i = min(id1, id2), max(id1, id2)
-            return list(range(start_i, min(end_i, start_i + 199) + 1))
+            return list(range(start_i, min(end_i, start_i + MAX_BATCH_FILES - 1) + 1))
 
     if mode_key == "ask_link_pub_custom":
         ids: List[int] = []
@@ -350,7 +353,7 @@ def _build_message_ids(mode_key: str, raw_input: str, first_id: int) -> List[int
             elif part.isdigit():
                 ids.append(int(part))
         if ids:
-            return ids[:200]
+            return ids[:MAX_BATCH_FILES]
 
     if mode_key == "ask_link_priv_range":
         urls = re.findall(r"https?://t\.me/\S+", txt)
@@ -359,13 +362,13 @@ def _build_message_ids(mode_key: str, raw_input: str, first_id: int) -> List[int
             _, id2, _ = _parse_single_link(urls[1])
             if id1 and id2:
                 start_i, end_i = min(id1, id2), max(id1, id2)
-                return list(range(start_i, min(end_i, start_i + 199) + 1))
+                return list(range(start_i, min(end_i, start_i + MAX_BATCH_FILES - 1) + 1))
 
     if "-" in txt and txt.replace("-", "").replace(" ", "").isdigit():
         a_s, b_s = txt.split("-", 1)
         a, b = int(a_s.strip()), int(b_s.strip())
         step = 1 if b >= a else -1
-        return list(range(a, min(b, a + step * 199) + step, step))
+        return list(range(a, min(b, a + step * (MAX_BATCH_FILES - 1)) + step, step))
 
     return [first_id]
 
@@ -400,7 +403,6 @@ async def _find_message_with_media(client: TelegramClient, entity, mid: int):
     msg = await client.get_messages(entity, ids=mid)
     if _has_downloadable_media(msg):
         return msg
-    # यदि पोस्ट एक एल्बम (grouped media) का हिस्सा है, तो आसपास के मैसेज भी जाँचें
     grouped_id = getattr(msg, "grouped_id", None) if msg else None
     if grouped_id:
         nearby = await client.get_messages(entity, ids=list(range(max(1, mid - 5), mid + 6)))
@@ -409,6 +411,39 @@ async def _find_message_with_media(client: TelegramClient, entity, mid: int):
                 if item and getattr(item, "grouped_id", None) == grouped_id and _has_downloadable_media(item):
                     return item
     return msg
+
+
+def _progress_bar(pct: float, length: int = 10) -> str:
+    clamped = max(0.0, min(100.0, pct))
+    filled = int(round((clamped / 100.0) * length))
+    return "█" * filled + "░" * (length - filled)
+
+
+def _format_live_status(
+    idx: int,
+    total: int,
+    delivered: int,
+    dl_pct: int,
+    dl_speed: float,
+    ul_pct: int,
+    ul_speed: float,
+    eta_sec: float,
+    phase_label: str,
+) -> str:
+    remaining = max(0, total - delivered)
+    overall_pct = int(round(((idx - 1 + (ul_pct / 100.0)) / max(1, total)) * 100))
+    overall_pct = max(0, min(100, overall_pct))
+    eta_str = f"{int(max(0, eta_sec))}s" if eta_sec >= 0 else "--"
+    bar = _progress_bar(overall_pct)
+    return (
+        "📊 <b>LIVE TRANSFER DASHBOARD</b>\n"
+        f"📁 <b>Files:</b> Total <code>{total}</code> | Done <code>{delivered}</code> | Remaining <code>{remaining}</code>\n"
+        f"📈 <b>Overall Progress:</b> <code>[{bar}] {overall_pct}%</code> (File <code>{idx}/{total}</code>)\n"
+        "──────────────────────\n"
+        f"⬇️ <b>Download:</b> <code>{dl_pct}%</code> | ⚡ <code>{dl_speed:.2f} MB/s</code>\n"
+        f"⬆️ <b>Upload:</b> <code>{ul_pct}%</code> | ⚡ <code>{ul_speed:.2f} MB/s</code>\n"
+        f"⏱️ <b>ETA:</b> <code>{eta_str}</code> | 🔄 <b>Status:</b> <code>{phase_label}</code>"
+    )
 
 
 async def _send_media_with_settings(bot, dest_chat, file_path: str, caption_text: str, thumb_path: Optional[str], tg_msg=None) -> None:
@@ -491,19 +526,31 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
     delivered = 0
     total = len(msg_ids)
     last_reason = ""
+    batch_start = time.perf_counter()
+    last_edit_ts = 0.0
+
+    async def _safe_edit_status(text_html: str, force: bool = False) -> None:
+        nonlocal last_edit_ts
+        now = time.perf_counter()
+        if not force and (now - last_edit_ts) < 0.8:
+            return
+        last_edit_ts = now
+        try:
+            await status_msg.edit_text(text_html, parse_mode="HTML")
+        except Exception:
+            pass
 
     try:
         for idx, mid in enumerate(msg_ids, start=1):
-            await asyncio.sleep(0.05)
             file_path: Optional[str] = None
+            elapsed_batch = max(time.perf_counter() - batch_start, 0.1)
+            avg_per_file = elapsed_batch / max(1, idx - 1) if idx > 1 else 2.0
+            eta_est = avg_per_file * (total - idx + 1)
 
-            try:
-                await status_msg.edit_text(
-                    f"⏳ <b>Live Status ({idx}/{total})</b>\n⬇️ Download: <b>50%</b> | Speed: <b>4.5 MB/s</b> | ETA: <b>2s</b>\n⬆️ Upload: <b>0%</b> | Speed: <b>0.0 MB/s</b> | ETA: <b>--</b>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
+            await _safe_edit_status(
+                _format_live_status(idx, total, delivered, 35, 4.5, 0, 0.0, eta_est, "Downloading"),
+                force=(idx == 1),
+            )
 
             try:
                 if is_private_peer and user_client is not None:
@@ -511,12 +558,15 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                     try:
                         entity = await _resolve_tg_entity(user_id, user_client, peer)
                         tg_msg = await _find_message_with_media(user_client, entity, mid)
+                    except FloodWaitError as fw:
+                        await asyncio.sleep(min(int(fw.seconds or 1) + 1, 30))
+                        continue
                     except AuthKeyUnregisteredError:
                         _delete_session_db(user_id)
                         _CLIENTS.pop(user_id, None)
-                        await status_msg.edit_text(
+                        await _safe_edit_status(
                             "⚠️ <b>Telegram Session समाप्त हो गया है।</b>\nकृपया दोबारा TG Login करें।",
-                            parse_mode="HTML",
+                            force=True,
                         )
                         return delivered
                     except ChannelPrivateError:
@@ -540,6 +590,9 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                     except ChatForwardsRestrictedError:
                         last_reason = "इस चैनल/मैसेज पर फ़ॉरवर्ड/डाउनलोड प्रतिबंध लगा है।"
                         continue
+                    except FloodWaitError as fw:
+                        await asyncio.sleep(min(int(fw.seconds or 1) + 1, 30))
+                        continue
                     except RPCError as exc:
                         last_reason = f"डाउनलोड त्रुटि: {exc.__class__.__name__}"
                         continue
@@ -552,16 +605,21 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                     fsize_mb = os.path.getsize(file_path) / (1024 * 1024)
                     dl_speed = fsize_mb / dl_time
 
-                    try:
-                        await status_msg.edit_text(
-                            f"⏳ <b>Live Status ({idx}/{total})</b>\n⬇️ Download: <b>100%</b> | Speed: <b>{dl_speed:.1f} MB/s</b> | ETA: <b>0s</b>\n⬆️ Upload: <b>60%</b> | Speed: <b>4.2 MB/s</b> | ETA: <b>2s</b>",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass
+                    await _safe_edit_status(
+                        _format_live_status(idx, total, delivered, 100, dl_speed, 50, dl_speed * 0.95, eta_est, "Uploading"),
+                        force=True,
+                    )
 
+                    u0 = time.perf_counter()
                     await _send_media_with_settings(bot, dest_chat, file_path, caption_text, thumb_path, tg_msg=tg_msg)
+                    ul_time = max(time.perf_counter() - u0, 0.05)
+                    ul_speed = fsize_mb / ul_time
                     delivered += 1
+
+                    await _safe_edit_status(
+                        _format_live_status(idx, total, delivered, 100, dl_speed, 100, ul_speed, max(0.0, eta_est - ul_time), "Uploaded"),
+                        force=True,
+                    )
                 else:
                     caption_text = _apply_text_rules("", settings)
                     copied_ok = False
@@ -575,6 +633,9 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                         )
                         copied_ok = True
                         delivered += 1
+                        await _safe_edit_status(
+                            _format_live_status(idx, total, delivered, 100, 10.0, 100, 10.0, eta_est, "Uploaded"),
+                        )
                     except Exception:
                         copied_ok = False
 
@@ -582,6 +643,7 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                         if user_client is None:
                             user_client = await get_user_client(user_id)
                         if user_client is not None:
+                            t0 = time.perf_counter()
                             try:
                                 entity = await _resolve_tg_entity(user_id, user_client, peer)
                                 tg_msg = await _find_message_with_media(user_client, entity, mid)
@@ -596,8 +658,19 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                                 caption_text = _apply_text_rules(tg_msg.message or "", settings)
                                 file_path = await user_client.download_media(tg_msg, file=os.path.join(DOWNLOAD_DIR, f"{user_id}_{mid}_"))
                                 if file_path and os.path.exists(file_path):
+                                    dl_time = max(time.perf_counter() - t0, 0.05)
+                                    fsize_mb = os.path.getsize(file_path) / (1024 * 1024)
+                                    dl_speed = fsize_mb / dl_time
+                                    await _safe_edit_status(
+                                        _format_live_status(idx, total, delivered, 100, dl_speed, 50, dl_speed * 0.95, eta_est, "Uploading"),
+                                    )
+                                    u0 = time.perf_counter()
                                     await _send_media_with_settings(bot, dest_chat, file_path, caption_text, thumb_path, tg_msg=tg_msg)
+                                    ul_speed = fsize_mb / max(time.perf_counter() - u0, 0.05)
                                     delivered += 1
+                                    await _safe_edit_status(
+                                        _format_live_status(idx, total, delivered, 100, dl_speed, 100, ul_speed, eta_est, "Uploaded"),
+                                    )
             finally:
                 if file_path and os.path.exists(file_path):
                     try:
@@ -606,16 +679,21 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                         pass
 
         if delivered > 0:
-            await status_msg.edit_text(
-                f"⏳ <b>Live Status ({total}/{total})</b>\n⬇️ Download: <b>100%</b> | Speed: <b>4.5 MB/s</b> | ETA: <b>0s</b>\n⬆️ Upload: <b>100%</b> | Speed: <b>4.2 MB/s</b> | ETA: <b>0s</b>\n\n✅ <b>Delivered: {delivered}/{total}</b>",
-                parse_mode="HTML",
+            rem_final = max(0, total - delivered)
+            await _safe_edit_status(
+                "📊 <b>LIVE TRANSFER DASHBOARD — COMPLETE</b>\n"
+                f"📁 <b>Files:</b> Total <code>{total}</code> | Done <code>{delivered}</code> | Remaining <code>{rem_final}</code>\n"
+                f"📈 <b>Overall Progress:</b> <code>[{_progress_bar(100)}] 100%</code>\n"
+                "──────────────────────\n"
+                "✅ <b>सभी उपलब्ध मीडिया फ़ाइलें सफलतापूर्वक भेज दी गईं।</b>",
+                force=True,
             )
         else:
             detail = f"\n<b>कारण:</b> {last_reason}" if last_reason else ""
-            await status_msg.edit_text(
+            await _safe_edit_status(
                 "⚠️ <b>कोई मीडिया/वीडियो नहीं भेजा जा सका।</b>"
                 f"{detail}\nजाँचें कि लिंक सही है, वीडियो मौजूद है, या लॉगिन किए हुए Telegram अकाउंट की उस Private चैनल तक पहुँच है।",
-                parse_mode="HTML",
+                force=True,
             )
         return delivered
     finally:
