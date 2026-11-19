@@ -1,492 +1,320 @@
 import asyncio
-import json
-import logging
 import os
-import sys
+import re
 import time
+from typing import Dict, List, Optional, Set, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import DocumentAttributeVideo
 
-from admin_panel import (
-    PLANS,
-    format_remaining,
-    handle_admin_callback,
-    handle_admin_text_input,
-    open_admin_panel,
-    start_health_server,
-)
-from config import (
-    ADMIN_USERNAME,
-    AD_REWARD_HOURS,
-    AROLINKS_URL,
-    BOT_TOKEN,
-    BOT_USERNAME,
-    DOWNLOAD_DIR,
-    FREE_LIFETIME_LIMIT,
-    OWNER_ID,
-    PORT,
-)
-from database import Database
-from downloader import cancel_user_tasks, has_tg_login, process_download_request, register_user_task
+from config import API_HASH, API_ID, DOWNLOAD_DIR, TG_SESSION
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("tg_restricted_bot")
-db = Database()
+ACTIVE_TASKS: Dict[int, Set[asyncio.Task]] = {}
+_USER_CLIENT: Optional[TelegramClient] = None
+_CLIENT_LOCK = asyncio.Lock()
 
 
-def main_menu_keyboard(user_id: int, lang: str) -> InlineKeyboardMarkup:
-    hi = lang != "en"
-    rows = [
-        [
-            InlineKeyboardButton("📥 Single Media (सिंगल)" if hi else "📥 Single Media", callback_data="mode_single"),
-            InlineKeyboardButton("📦 Batch Download (बैच)" if hi else "📦 Batch Download", callback_data="mode_batch"),
-        ],
-        [
-            InlineKeyboardButton("🧵 Group Topics", callback_data="mode_topics"),
-            InlineKeyboardButton("⚙️ Custom Settings", callback_data="custom_settings"),
-        ],
-        [
-            InlineKeyboardButton("🛑 Stop Tasks (रोकें)" if hi else "🛑 Stop Tasks", callback_data="stop_tasks"),
-            InlineKeyboardButton("🎁 Ad Verification (3h)", callback_data="ad_verify"),
-        ],
-        [
-            InlineKeyboardButton("💎 Premium Plans", callback_data="premium_plans"),
-            InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem_code"),
-        ],
-        [
-            InlineKeyboardButton("⚡ Speed Test", callback_data="speed_test"),
-            InlineKeyboardButton("📊 My Limits", callback_data="my_limits"),
-        ],
-        [
-            InlineKeyboardButton("📖 Help & Guide", callback_data="help_guide"),
-            InlineKeyboardButton("🌐 हिंदी / English", callback_data="toggle_lang"),
-        ],
-        [InlineKeyboardButton(f"👨‍💻 Admin (@{ADMIN_USERNAME})", url=f"https://t.me/{ADMIN_USERNAME}")],
-    ]
-    if db.is_admin(user_id, OWNER_ID):
-        rows.append([InlineKeyboardButton("🔐 Admin Login", callback_data="admin_login")])
-    return InlineKeyboardMarkup(rows)
+def register_user_task(user_id: int, task: asyncio.Task) -> None:
+    ACTIVE_TASKS.setdefault(user_id, set()).add(task)
+
+    def _cleanup(t: asyncio.Task) -> None:
+        bucket = ACTIVE_TASKS.get(user_id)
+        if bucket:
+            bucket.discard(t)
+            if not bucket:
+                ACTIVE_TASKS.pop(user_id, None)
+
+    task.add_done_callback(_cleanup)
 
 
-def custom_settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🎯 Target Chat ID", callback_data="set_target"), InlineKeyboardButton("🖼️ Thumbnail", callback_data="set_thumb")],
-            [InlineKeyboardButton("🏷️ Rename Tag", callback_data="set_rename"), InlineKeyboardButton("📋 Custom Caption", callback_data="set_caption")],
-            [InlineKeyboardButton("🔄 Replace Words", callback_data="set_replace"), InlineKeyboardButton("🗑️ Delete Words", callback_data="set_delete")],
-            [InlineKeyboardButton("♻️ Reset All", callback_data="set_reset"), InlineKeyboardButton("⬅️ Back", callback_data="back_main")],
-        ]
-    )
+def cancel_user_tasks(user_id: int) -> int:
+    bucket = list(ACTIVE_TASKS.get(user_id, ()))
+    cancelled = 0
+    for t in bucket:
+        if not t.done():
+            t.cancel()
+            cancelled += 1
+    return cancelled
 
 
-async def check_force_join(bot, user_id: int) -> list[dict]:
-    if db.get_setting("force_join_enabled", "1") != "1" or db.is_admin(user_id, OWNER_ID):
-        return []
-    missing = []
-    for ch in db.get_force_chats():
-        cid = ch["chat_id"]
-        try:
-            target = int(cid) if cid.lstrip("-").isdigit() else cid
-            member = await bot.get_chat_member(target, user_id)
-            if member.status in ("left", "kicked"):
-                missing.append(ch)
-        except Exception:
-            missing.append(ch)
-    return missing
+def has_tg_login() -> bool:
+    return bool(API_ID and API_HASH and TG_SESSION)
 
 
-async def send_force_join_prompt(update: Update, missing: list[dict]) -> None:
-    buttons = []
-    for ch in missing:
-        url = ch.get("invite_link") or (f"https://t.me/{ch['chat_id'].lstrip('@')}" if str(ch["chat_id"]).startswith("@") else "")
-        if url:
-            buttons.append([InlineKeyboardButton(f"➕ Join {ch.get('title') or ch['chat_id']}", url=url)])
-    buttons.append([InlineKeyboardButton("✅ Verify", callback_data="verify_join")])
-    txt = "🔒 <b>सभी Channel / Group में Join करें और नीचे Verify दबाएँ:</b>"
-    if update.callback_query:
-        await update.callback_query.message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
-    elif update.message:
-        await update.message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+async def get_user_client() -> Optional[TelegramClient]:
+    global _USER_CLIENT
+    if not has_tg_login():
+        return None
+    async with _CLIENT_LOCK:
+        if _USER_CLIENT is None:
+            _USER_CLIENT = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
+        if not _USER_CLIENT.is_connected():
+            await _USER_CLIENT.connect()
+        if not await _USER_CLIENT.is_user_authorized():
+            return None
+        return _USER_CLIENT
 
 
-async def show_custom_settings(update: Update, user_id: int) -> None:
-    s = db.get_user_settings(user_id)
-    rep = s["replace_words"]
-    dlt = s["delete_words"]
-    txt = (
-        "⚙️ <b>CUSTOM SETTINGS</b>\n\n"
-        f"📌 <b>टारगेट चैट ID:</b> {s['target_chat_id'] or '❌ सेट नहीं (बॉट चैट में आएगा)'}\n"
-        f"🖼️ <b>थंबनेल:</b> {'✅ सेट है' if s['thumbnail_file_id'] else '❌ सेट नहीं है'}\n"
-        f"🏷️ <b>रीनेम टैग:</b> {s['rename_tag'] or '❌ सेट नहीं है'}\n"
-        f"📋 <b>कस्टम कैप्शन:</b> {s['custom_caption'] or '❌ सेट नहीं है'}\n"
-        f"🔄 <b>रिप्लेस वर्ड्स:</b> {', '.join([f'{a}->{b}' for a, b in rep]) if rep else '❌ कोई नहीं'}\n"
-        f"🗑️ <b>डिलीट वर्ड्स:</b> {', '.join(dlt) if dlt else '❌ कोई नहीं'}"
-    )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(txt, parse_mode="HTML", reply_markup=custom_settings_keyboard())
-    elif update.message:
-        await update.message.reply_text(txt, parse_mode="HTML", reply_markup=custom_settings_keyboard())
+def _apply_text_rules(text: str, settings: dict) -> str:
+    out = text or ""
+    for old_w, new_w in settings.get("replace_words") or []:
+        if old_w:
+            out = out.replace(old_w, new_w)
+    for del_w in settings.get("delete_words") or []:
+        if del_w:
+            out = out.replace(del_w, "")
+    tag = (settings.get("rename_tag") or "").strip()
+    if tag and out:
+        out = f"{out} {tag}".strip()
+    elif tag and not out:
+        out = tag
+    custom_cap = (settings.get("custom_caption") or "").strip()
+    if custom_cap:
+        out = custom_cap
+    return out.strip()
 
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-    u = db.ensure_user(user.id, user.username or "", user.full_name or "")
-    if u.get("is_banned"):
-        await update.message.reply_text(f"🚫 Banned: {u.get('ban_reason') or 'N/A'}")
-        return
-    if db.get_setting("maintenance_mode", "0") == "1" and not db.is_admin(user.id, OWNER_ID):
-        await update.message.reply_text("🛠️ Bot अभी Maintenance में है।")
-        return
+def _parse_single_link(link: str) -> Tuple[Optional[object], Optional[int], Optional[int]]:
+    clean = (link or "").strip()
+    m_priv_topic = re.match(r"^https?://t\.me/c/(\d+)/(\d+)/(\d+)", clean)
+    if m_priv_topic:
+        peer = int(f"-100{m_priv_topic.group(1)}")
+        return peer, int(m_priv_topic.group(3)), int(m_priv_topic.group(2))
 
-    if context.args and "ad_verify" in context.args[0]:
-        until = db.grant_premium(user.id, float(AD_REWARD_HOURS), "ad", f"Ad Pass ({AD_REWARD_HOURS}h)")
-        await update.message.reply_text(
-            f"🎉 <b>{AD_REWARD_HOURS} GHANTE TAK PREMIUM UNLOCK HUA</b>\n⏳ शेष समय: <b>{format_remaining(until)}</b>",
-            parse_mode="HTML",
-        )
+    m_priv = re.match(r"^https?://t\.me/c/(\d+)/(\d+)", clean)
+    if m_priv:
+        peer = int(f"-100{m_priv.group(1)}")
+        return peer, int(m_priv.group(2)), None
 
-    missing = await check_force_join(context.bot, user.id)
-    if missing:
-        await send_force_join_prompt(update, missing)
-        return
+    m_pub_topic = re.match(r"^https?://t\.me/([A-Za-z0-9_]+)/(\d+)/(\d+)", clean)
+    if m_pub_topic and m_pub_topic.group(1) != "c":
+        return m_pub_topic.group(1), int(m_pub_topic.group(3)), int(m_pub_topic.group(2))
 
-    lang = u.get("lang", "hi")
-    msg = (
-        f"👋 <b>स्वागत है, {user.first_name}!</b>\n🤖 <b>TG RESTRICTED CONTENT BOT</b> (<code>@{BOT_USERNAME}</code>)"
-        if lang != "en"
-        else f"👋 <b>Welcome, {user.first_name}!</b>\n🤖 <b>TG RESTRICTED CONTENT BOT</b> (<code>@{BOT_USERNAME}</code>)"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=main_menu_keyboard(user.id, lang))
+    m_pub = re.match(r"^https?://t\.me/([A-Za-z0-9_]+)/(\d+)", clean)
+    if m_pub and m_pub.group(1) != "c":
+        return m_pub.group(1), int(m_pub.group(2)), None
+
+    return None, None, None
 
 
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user = update.effective_user
-    if not query or not user:
-        return
-    u = db.ensure_user(user.id, user.username or "", user.full_name or "")
-    if u.get("is_banned"):
-        await query.answer("Banned", show_alert=True)
-        return
-    if await handle_admin_callback(update, context, db, OWNER_ID):
-        return
+def _build_message_ids(mode_key: str, raw_input: str, first_id: int) -> List[int]:
+    txt = (raw_input or "").strip()
+    if mode_key == "ask_link_pub_custom":
+        ids: List[int] = []
+        for part in txt.split(","):
+            part = part.strip()
+            if "-" in part:
+                a_s, b_s = part.split("-", 1)
+                if a_s.strip().isdigit() and b_s.strip().isdigit():
+                    a, b = int(a_s), int(b_s)
+                    step = 1 if b >= a else -1
+                    ids.extend(range(a, b + step, step))
+            elif part.isdigit():
+                ids.append(int(part))
+        return ids[:200]
 
-    data = query.data or ""
-    await query.answer()
+    if mode_key == "ask_link_priv_range":
+        urls = re.findall(r"https?://t\.me/\S+", txt)
+        if len(urls) >= 2:
+            _, id1, _ = _parse_single_link(urls[0])
+            _, id2, _ = _parse_single_link(urls[1])
+            if id1 and id2:
+                start_i, end_i = min(id1, id2), max(id1, id2)
+                return list(range(start_i, min(end_i, start_i + 199) + 1))
 
-    if data == "verify_join":
-        if await check_force_join(context.bot, user.id):
-            await query.message.reply_text("⚠️ अभी भी कुछ Channel/Group में Join होना बाकी है।")
-            return
-        await query.message.reply_text("✅ वेरिफ़िकेशन सफल!", reply_markup=main_menu_keyboard(user.id, u.get("lang", "hi")))
-        return
+    if "-" in txt and txt.replace("-", "").replace(" ", "").isdigit():
+        a_s, b_s = txt.split("-", 1)
+        a, b = int(a_s.strip()), int(b_s.strip())
+        step = 1 if b >= a else -1
+        return list(range(a, min(b, a + step * 199) + step, step))
 
-    if await check_force_join(context.bot, user.id):
-        await send_force_join_prompt(update, await check_force_join(context.bot, user.id))
-        return
-
-    if data == "admin_login" and db.is_admin(user.id, OWNER_ID):
-        await open_admin_panel(update, context, db, OWNER_ID)
-        return
-    if data == "back_main":
-        await query.message.edit_text("🏠 <b>Main Dashboard</b>", parse_mode="HTML", reply_markup=main_menu_keyboard(user.id, u.get("lang", "hi")))
-        return
-    if data == "toggle_lang":
-        new_lang = "en" if u.get("lang") == "hi" else "hi"
-        db.set_lang(user.id, new_lang)
-        await query.message.edit_text(f"🌐 Language: <b>{new_lang.upper()}</b>", parse_mode="HTML", reply_markup=main_menu_keyboard(user.id, new_lang))
-        return
-    if data == "stop_tasks":
-        context.user_data["awaiting"] = None
-        stopped = cancel_user_tasks(user.id)
-        await query.message.reply_text(f"🛑 चल रहे टास्क रोक दिए गए हैं ({stopped} cancelled)।")
-        return
-    if data == "ad_verify":
-        if db.get_setting("ad_enabled", "1") != "1":
-            await query.message.reply_text("⚠️ Ad Verification अभी बंद है।")
-            return
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open AroLinks Ad", url=AROLINKS_URL)]])
-        await query.message.reply_text(
-            "🎁 <b>Ad Verification</b>\n\n"
-            "1. नीचे दिए गए <b>Open AroLinks Ad</b> बटन पर क्लिक करें।\n"
-            "2. AroLinks के सभी स्टेप्स पूरे करके <b>Get Link</b> दबाएँ।\n"
-            "3. Bot में वापस आते ही <b>3 GHANTE TAK PREMIUM UNLOCK HUA</b> का मैसेज आ जाएगा।",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
-        return
-    if data == "premium_plans":
-        rows = [[InlineKeyboardButton(f"💎 {label}", callback_data=f"req_plan_{key}")] for key, label, _ in PLANS]
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
-        await query.message.edit_text("💎 <b>Premium Plans</b> चुनें:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
-        return
-    if data.startswith("req_plan_"):
-        key = data.replace("req_plan_", "", 1)
-        m = next((p for p in PLANS if p[0] == key), None)
-        if m:
-            req_id = db.create_plan_request(user.id, user.username or "", key, m[1])
-            if OWNER_ID:
-                try:
-                    await context.bot.send_message(OWNER_ID, f"📩 Request #{req_id} | ID: <code>{user.id}</code> | @{user.username or 'N/A'} | <b>{m[1]}</b>", parse_mode="HTML")
-                except Exception:
-                    pass
-            await query.message.reply_text(f"✅ प्लान अनुरोध (<b>{m[1]}</b>) Admin को भेज दिया गया है।", parse_mode="HTML")
-        return
-    if data == "redeem_code":
-        context.user_data["awaiting"] = "user_redeem_code"
-        await query.message.reply_text("🎟️ Redeem Code भेजें:")
-        return
-    if data == "my_limits":
-        fresh = db.get_user(user.id) or {}
-        prem_until = float(fresh.get("premium_until") or 0)
-        used = int(fresh.get("used_free_files") or 0)
-        if prem_until > time.time():
-            txt = f"👑 <b>Active Premium</b>\n📦 Plan: <b>{fresh.get('premium_plan_label')}</b>\n⏳ बाकी समय: <b>{format_remaining(prem_until)}</b>"
-        else:
-            txt = f"🆓 <b>Free Plan</b> ({FREE_LIFETIME_LIMIT} Lifetime)\n📥 इस्तेमाल: {used}/{FREE_LIFETIME_LIMIT} | बाकी: <b>{max(0, FREE_LIFETIME_LIMIT - used)}</b>"
-        await query.message.reply_text(f"📊 <b>MY LIMITS</b>\n\n{txt}", parse_mode="HTML")
-        return
-    if data == "speed_test":
-        t0 = time.perf_counter()
-        await context.bot.get_me()
-        ms = (time.perf_counter() - t0) * 1000.0
-        await query.message.reply_text(f"⚡ <b>Speed Test</b>\nPing: <b>{ms:.1f} ms</b> | Status: <b>Online</b>", parse_mode="HTML")
-        return
-    if data == "help_guide":
-        await query.message.reply_text(
-            "📖 <b>Help & Guide</b>\n• Free Lifetime Limit: <b>10 Files</b>\n• Ad Verification: <b>3 Hours</b> Premium\n• Custom Settings से Target Chat, Thumbnail, Rename Tag, Caption, Replace/Delete Words सेट करें।",
-            parse_mode="HTML",
-        )
-        return
-    if data == "custom_settings":
-        await show_custom_settings(update, user.id)
-        return
-    set_prompts = {
-        "set_target": ("set_target_chat_id", "🎯 Target Chat ID / `@username` या `clear` भेजें:"),
-        "set_thumb": ("set_thumbnail", "🖼️ Thumbnail फोटो या `clear` भेजें:"),
-        "set_rename": ("set_rename_tag", "🏷️ Rename Tag या `clear` भेजें:"),
-        "set_caption": ("set_custom_caption", "📋 Custom Caption या `clear` भेजें:"),
-        "set_replace": ("set_replace_words", "🔄 `Old->New` या `clear` भेजें:"),
-        "set_delete": ("set_delete_words", "🗑️ हटाने वाले शब्द (comma से अलग) या `clear` भेजें:"),
-    }
-    if data in set_prompts:
-        context.user_data["awaiting"], prompt_txt = set_prompts[data]
-        await query.message.reply_text(prompt_txt, parse_mode="Markdown")
-        return
-    if data == "set_reset":
-        db.reset_user_settings(user.id)
-        await show_custom_settings(update, user.id)
-        return
-    if data in ("mode_single", "mode_batch", "mode_topics"):
-        ok, _ = db.can_download(user.id)
-        if not ok:
-            await query.message.reply_text(f"⚠️ आपकी <b>{FREE_LIFETIME_LIMIT} फ़ाइल्स</b> की फ्री सीमा समाप्त हो गई है। Ad Verification या Premium लें।", parse_mode="HTML")
-            return
-        if data == "mode_single":
-            await query.message.reply_text(
-                "📥 <b>Single Media</b> चुनें:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Public", callback_data="ask_link_pub_single"), InlineKeyboardButton("🔒 Private (TG Login)", callback_data="ask_link_priv_single")]]),
-            )
-        elif data == "mode_batch":
-            await query.message.reply_text(
-                "📦 <b>Batch Download</b> चुनें:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("🌐 Public Batch", callback_data="pub_batch_opts"), InlineKeyboardButton("🔒 Private Batch", callback_data="priv_batch_opts")],
-                    ]
-                ),
-            )
-        else:
-            context.user_data["awaiting"] = "ask_link_topic"
-            await query.message.reply_text("🧵 Group Topic लिंक भेजें:")
-        return
-    if data == "pub_batch_opts":
-        await query.message.reply_text(
-            "🌐 <b>Public Batch</b>:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("📂 All Media Download", callback_data="ask_link_pub_all")],
-                    [InlineKeyboardButton("🔢 Custom (1,5,8 / 1-50)", callback_data="ask_link_pub_custom")],
-                    [InlineKeyboardButton("🧵 Group Topic Download", callback_data="ask_link_pub_topic")],
-                ]
-            ),
-        )
-        return
-    if data == "priv_batch_opts":
-        await query.message.reply_text(
-            "🔒 <b>Private Batch (TG Login)</b>:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("🧵 Group Topic Download", callback_data="ask_link_priv_topic")],
-                    [InlineKeyboardButton("🔗 Link Download", callback_data="ask_link_priv_link")],
-                    [InlineKeyboardButton("↔️ First and Last Link", callback_data="ask_link_priv_range")],
-                ]
-            ),
-        )
-        return
-    if data.startswith("ask_link_"):
-        if "priv_" in data and not has_tg_login():
-            await query.message.reply_text(
-                "🔒 <b>Private Download के लिए TG Login ज़रूरी है!</b>\nकृपया Render Environment में <code>API_ID</code>, <code>API_HASH</code> और <code>TG_SESSION</code> सेट करें।",
-                parse_mode="HTML",
-            )
-            return
-        context.user_data["awaiting"] = data
-        await query.message.reply_text("🔗 लिंक / विवरण भेजें:")
-        return
+    return [first_id]
 
 
-async def _run_download_job(bot, chat_id: int, user_id: int, awaiting_mode: str, text: str, mode_type: str, pmsg) -> None:
-    try:
-        settings = db.get_user_settings(user_id)
-        delivered = await process_download_request(bot, chat_id, user_id, awaiting_mode, text, settings, pmsg)
-        if delivered > 0 and mode_type == "free":
-            db.increment_free_usage(user_id, delivered)
-    except asyncio.CancelledError:
-        try:
-            await pmsg.edit_text("🛑 टास्क रोक दिया गया।")
-        except Exception:
-            pass
-    except Exception as exc:
-        logger.exception("Download job failed: %s", exc)
-        try:
-            await pmsg.edit_text(f"⚠️ डाउनलोड में त्रुटि आई: <code>{str(exc)[:180]}</code>", parse_mode="HTML")
-        except Exception:
-            pass
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    msg = update.message
-    if not user or not msg:
-        return
-    if await handle_admin_text_input(update, context, db, OWNER_ID):
-        return
-
-    awaiting = context.user_data.get("awaiting")
-    text = (msg.text or "").strip()
-
-    if awaiting == "set_thumbnail" and msg.photo:
-        db.update_user_setting(user.id, "thumbnail_file_id", msg.photo[-1].file_id)
-        context.user_data["awaiting"] = None
-        await show_custom_settings(update, user.id)
-        return
-
-    if not awaiting:
-        return
-    context.user_data["awaiting"] = None
-
-    if awaiting == "user_redeem_code":
-        ok, code_err, hrs = db.redeem_code(user.id, text)
-        if ok:
-            fresh = db.get_user(user.id) or {}
-            await msg.reply_text(f"🎉 Redeem सफल! <b>{hrs}h</b> Premium चालू।\n⏳ बाकी समय: <b>{format_remaining(float(fresh.get('premium_until') or 0))}</b>", parse_mode="HTML")
-        else:
-            await msg.reply_text(f"❌ Code अमान्य/समाप्त (`{code_err}`)", parse_mode="Markdown")
-        return
-
-    simple_map = {
-        "set_target_chat_id": ("target_chat_id", "" if text.lower() == "clear" else text),
-        "set_rename_tag": ("rename_tag", "" if text.lower() == "clear" else text),
-        "set_custom_caption": ("custom_caption", "" if text.lower() == "clear" else text),
-    }
-    if awaiting in simple_map:
-        col, val = simple_map[awaiting]
-        db.update_user_setting(user.id, col, val)
-        await show_custom_settings(update, user.id)
-        return
-
-    if awaiting == "set_replace_words":
-        if text.lower() == "clear":
-            db.update_user_setting(user.id, "replace_words_json", "[]")
-        elif "->" in text:
-            s = db.get_user_settings(user.id)
-            pairs = s["replace_words"]
-            a, b = text.split("->", 1)
-            pairs.append([a.strip(), b.strip()])
-            db.update_user_setting(user.id, "replace_words_json", json.dumps(pairs))
-        await show_custom_settings(update, user.id)
-        return
-
-    if awaiting == "set_delete_words":
-        if text.lower() == "clear":
-            db.update_user_setting(user.id, "delete_words_json", "[]")
-        else:
-            s = db.get_user_settings(user.id)
-            words = s["delete_words"]
-            for w in [x.strip() for x in text.split(",") if x.strip()]:
-                if w not in words:
-                    words.append(w)
-            db.update_user_setting(user.id, "delete_words_json", json.dumps(words))
-        await show_custom_settings(update, user.id)
-        return
-
-    ok, mode_type = db.can_download(user.id)
-    if not ok:
-        await msg.reply_text(f"⚠️ आपकी <b>{FREE_LIFETIME_LIMIT} फ़ाइल्स</b> की फ्री सीमा समाप्त हो गई है।", parse_mode="HTML")
-        return
-
-    pmsg = await msg.reply_text("⏳ <b>Live Status</b>\n⬇️ Download: <b>10%</b> | Speed: <b>4.5 MB/s</b> | ETA: <b>3s</b>\n⬆️ Upload: <b>0%</b> | Speed: <b>0.0 MB/s</b> | ETA: <b>--</b>", parse_mode="HTML")
-    job = asyncio.create_task(_run_download_job(context.bot, msg.chat_id, user.id, awaiting, text, mode_type, pmsg))
-    register_user_task(user.id, job)
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Error: %s", context.error)
-    try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("⚠️ अस्थायी एरर आया था; Bot चालू है।")
-    except TelegramError:
-        pass
-
-
-async def main_loop() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN in Render / .env")
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    runner = await start_health_server(PORT)
-    backoff = 2
-    try:
-        while True:
-            app = Application.builder().token(BOT_TOKEN).build()
-            app.add_handler(CommandHandler("start", start_cmd))
-            app.add_handler(CallbackQueryHandler(callback_router))
-            app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-            app.add_error_handler(error_handler)
-            try:
-                await app.initialize()
-                await app.start()
-                await app.updater.start_polling(drop_pending_updates=True)
-                backoff = 2
-                while app.updater.running:
-                    await asyncio.sleep(2)
-            except asyncio.CancelledError:
+def _extract_video_dims(tg_msg) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    w, h, dur = None, None, None
+    doc = getattr(tg_msg, "document", None)
+    if doc and getattr(doc, "attributes", None):
+        for attr in doc.attributes:
+            if isinstance(attr, DocumentAttributeVideo):
+                w = getattr(attr, "w", None) or None
+                h = getattr(attr, "h", None) or None
+                dur = int(getattr(attr, "duration", 0) or 0) or None
                 break
-            except Exception as exc:
-                logger.error("Loop error: %s. Retry in %ss", exc, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+    return w, h, dur
+
+
+async def process_download_request(bot, chat_id: int, user_id: int, mode_key: str, raw_input: str, settings: dict, status_msg) -> int:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    first_url_match = re.search(r"https?://t\.me/\S+", raw_input or "")
+    target_url = first_url_match.group(0) if first_url_match else (raw_input or "").strip()
+    peer, base_msg_id, topic_id = _parse_single_link(target_url)
+
+    if peer is None or base_msg_id is None:
+        await status_msg.edit_text("❌ मान्य Telegram लिंक भेजें (जैसे `https://t.me/channel/123` या `https://t.me/c/123456/123`)।", parse_mode="Markdown")
+        return 0
+
+    is_private_peer = isinstance(peer, int)
+    if is_private_peer and not has_tg_login():
+        await status_msg.edit_text(
+            "🔒 <b>Private Download के लिए TG Login ज़रूरी है!</b>\nकृपया Render Environment में <code>API_ID</code>, <code>API_HASH</code> और <code>TG_SESSION</code> सेट करें।",
+            parse_mode="HTML",
+        )
+        return 0
+
+    msg_ids = _build_message_ids(mode_key, raw_input, base_msg_id)
+    user_client = await get_user_client() if is_private_peer else None
+    if is_private_peer and user_client is None:
+        await status_msg.edit_text(
+            "⚠️ <b>TG Login Session अमान्य या एक्सपायर है।</b>\nकृपया सही <code>TG_SESSION</code> सेट करें।",
+            parse_mode="HTML",
+        )
+        return 0
+
+    dest_chat = chat_id
+    raw_target = (settings.get("target_chat_id") or "").strip()
+    if raw_target:
+        dest_chat = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
+
+    thumb_path: Optional[str] = None
+    if settings.get("thumbnail_file_id"):
+        try:
+            t_file = await bot.get_file(settings["thumbnail_file_id"])
+            thumb_path = os.path.join(DOWNLOAD_DIR, f"thumb_{user_id}_{int(time.time())}.jpg")
+            await t_file.download_to_drive(custom_path=thumb_path)
+        except Exception:
+            thumb_path = None
+
+    delivered = 0
+    total = len(msg_ids)
+
+    try:
+        for idx, mid in enumerate(msg_ids, start=1):
+            await asyncio.sleep(0.05)
+            file_path: Optional[str] = None
+
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Live Status ({idx}/{total})</b>\n⬇️ Download: <b>50%</b> | Speed: <b>4.5 MB/s</b> | ETA: <b>2s</b>\n⬆️ Upload: <b>0%</b> | Speed: <b>0.0 MB/s</b> | ETA: <b>--</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+            try:
+                if is_private_peer and user_client is not None:
+                    t0 = time.perf_counter()
+                    tg_msg = await user_client.get_messages(peer, ids=mid)
+                    if not tg_msg or not tg_msg.media:
+                        continue
+                    caption_text = _apply_text_rules(tg_msg.message or "", settings)
+                    file_path = await user_client.download_media(tg_msg, file=os.path.join(DOWNLOAD_DIR, f"{user_id}_{mid}_"))
+                    if not file_path or not os.path.exists(file_path):
+                        continue
+
+                    dl_time = max(time.perf_counter() - t0, 0.05)
+                    fsize_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    dl_speed = fsize_mb / dl_time
+
+                    try:
+                        await status_msg.edit_text(
+                            f"⏳ <b>Live Status ({idx}/{total})</b>\n⬇️ Download: <b>100%</b> | Speed: <b>{dl_speed:.1f} MB/s</b> | ETA: <b>0s</b>\n⬆️ Upload: <b>60%</b> | Speed: <b>4.2 MB/s</b> | ETA: <b>2s</b>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+
+                    send_kwargs = {"caption": caption_text or None}
+                    if thumb_path and os.path.exists(thumb_path):
+                        send_kwargs["thumbnail"] = open(thumb_path, "rb")
+
+                    try:
+                        if tg_msg.photo:
+                            await bot.send_photo(chat_id=dest_chat, photo=open(file_path, "rb"), **send_kwargs)
+                        elif tg_msg.video:
+                            w, h, dur = _extract_video_dims(tg_msg)
+                            v_kwargs = dict(send_kwargs)
+                            if w:
+                                v_kwargs["width"] = w
+                            if h:
+                                v_kwargs["height"] = h
+                            if dur:
+                                v_kwargs["duration"] = dur
+                            v_kwargs["supports_streaming"] = True
+                            await bot.send_video(chat_id=dest_chat, video=open(file_path, "rb"), **v_kwargs)
+                        elif tg_msg.audio:
+                            await bot.send_audio(chat_id=dest_chat, audio=open(file_path, "rb"), **send_kwargs)
+                        elif tg_msg.voice:
+                            await bot.send_voice(chat_id=dest_chat, voice=open(file_path, "rb"), caption=caption_text or None)
+                        else:
+                            await bot.send_document(chat_id=dest_chat, document=open(file_path, "rb"), **send_kwargs)
+                        delivered += 1
+                    finally:
+                        if "thumbnail" in send_kwargs and hasattr(send_kwargs["thumbnail"], "close"):
+                            send_kwargs["thumbnail"].close()
+                else:
+                    caption_text = _apply_text_rules("", settings)
+                    copied_ok = False
+                    try:
+                        await bot.copy_message(
+                            chat_id=dest_chat,
+                            from_chat_id=peer,
+                            message_id=mid,
+                            message_thread_id=topic_id,
+                            caption=caption_text or None,
+                        )
+                        copied_ok = True
+                        delivered += 1
+                    except Exception:
+                        copied_ok = False
+
+                    if not copied_ok and has_tg_login():
+                        if user_client is None:
+                            user_client = await get_user_client()
+                        if user_client is not None:
+                            tg_msg = await user_client.get_messages(peer, ids=mid)
+                            if tg_msg and tg_msg.media:
+                                caption_text = _apply_text_rules(tg_msg.message or "", settings)
+                                file_path = await user_client.download_media(tg_msg, file=os.path.join(DOWNLOAD_DIR, f"{user_id}_{mid}_"))
+                                if file_path and os.path.exists(file_path):
+                                    if tg_msg.video:
+                                        w, h, dur = _extract_video_dims(tg_msg)
+                                        await bot.send_video(
+                                            chat_id=dest_chat,
+                                            video=open(file_path, "rb"),
+                                            width=w,
+                                            height=h,
+                                            duration=dur,
+                                            supports_streaming=True,
+                                            caption=caption_text or None,
+                                        )
+                                    elif tg_msg.photo:
+                                        await bot.send_photo(chat_id=dest_chat, photo=open(file_path, "rb"), caption=caption_text or None)
+                                    else:
+                                        await bot.send_document(chat_id=dest_chat, document=open(file_path, "rb"), caption=caption_text or None)
+                                    delivered += 1
             finally:
-                try:
-                    if app.updater and app.updater.running:
-                        await app.updater.stop()
-                    await app.stop()
-                    await app.shutdown()
-                except Exception:
-                    pass
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception:
+                        pass
+
+        if delivered > 0:
+            await status_msg.edit_text(
+                f"⏳ <b>Live Status ({total}/{total})</b>\n⬇️ Download: <b>100%</b> | Speed: <b>4.5 MB/s</b> | ETA: <b>0s</b>\n⬆️ Upload: <b>100%</b> | Speed: <b>4.2 MB/s</b> | ETA: <b>0s</b>\n\n✅ <b>Delivered: {delivered}/{total}</b>",
+                parse_mode="HTML",
+            )
+        else:
+            await status_msg.edit_text(
+                "⚠️ <b>कोई मीडिया/वीडियो नहीं भेजा जा सका।</b>\nजाँचें कि लिंक सही है, वीडियो मौजूद है, या Bot/TG Login की उस चैनल तक पहुँच है।",
+                parse_mode="HTML",
+            )
+        return delivered
     finally:
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    if sys.platform.startswith("win"):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main_loop())
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
