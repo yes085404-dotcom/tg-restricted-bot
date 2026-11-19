@@ -29,7 +29,16 @@ from config import (
     PORT,
 )
 from database import Database
-from downloader import cancel_user_tasks, has_tg_login, process_download_request, register_user_task
+from downloader import (
+    cancel_user_tasks,
+    has_tg_login,
+    logout_tg_user,
+    process_download_request,
+    register_user_task,
+    start_tg_phone_login,
+    submit_tg_2fa_password,
+    submit_tg_otp_code,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("tg_restricted_bot")
@@ -136,6 +145,22 @@ async def show_custom_settings(update: Update, user_id: int) -> None:
         await update.message.reply_text(txt, parse_mode="HTML", reply_markup=custom_settings_keyboard())
 
 
+async def _prompt_tg_login(message, user_id: int, next_action: str | None = None) -> None:
+    context_key = next_action or ""
+    logged = await has_tg_login(user_id)
+    rows = [
+        [InlineKeyboardButton("📱 Telegram Login करें", callback_data=f"tg_do_login|{context_key}")],
+    ]
+    if logged:
+        rows.append([InlineKeyboardButton("🚪 TG Logout करें", callback_data="tg_do_logout")])
+    txt = (
+        "🔐 <b>Telegram Login</b>\n\n"
+        f"स्थिति: <b>{'✅ Logged In (Private डाउनलोड चालू)' if logged else '❌ Logged Out'}</b>\n"
+        "लॉगिन करने के लिए नीचे <b>Telegram Login करें</b> दबाएँ और अपना फ़ोन नंबर + OTP (तथा 2FA यदि लगा हो) भेजें।"
+    )
+    await message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not update.message:
@@ -176,7 +201,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     data = query.data or ""
-    # सबसे पहले callback query को तुरंत acknowledge करें ताकि बटन दबाते ही UI fast लगे
     try:
         await query.answer()
     except Exception:
@@ -202,6 +226,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await open_admin_panel(update, context, db, OWNER_ID)
         return
 
+    if data.startswith("tg_do_login|"):
+        next_act = data.split("|", 1)[1].strip() or None
+        context.user_data["tg_next_action"] = next_act
+        context.user_data["awaiting"] = "tg_login_phone"
+        await query.message.reply_text(
+            "📱 अपना <b>Telegram फ़ोन नंबर</b> देश के कोड के साथ भेजें (जैसे <code>+919876543210</code>):",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "tg_do_logout":
+        await logout_tg_user(user.id)
+        context.user_data["awaiting"] = None
+        context.user_data["tg_next_action"] = None
+        await query.message.reply_text("🚪 <b>TG Logout हो गया।</b>", parse_mode="HTML")
+        return
+
     if data == "back_main":
         await query.message.edit_text("🏠 <b>Main Dashboard</b>", parse_mode="HTML", reply_markup=main_menu_keyboard(user.id, u.get("lang", "hi")))
         return
@@ -214,6 +255,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "stop_tasks":
         context.user_data["awaiting"] = None
+        context.user_data["tg_next_action"] = None
         stopped = cancel_user_tasks(user.id)
         await query.message.reply_text(f"🛑 चल रहे टास्क रोक दिए गए हैं ({stopped} cancelled)।")
         return
@@ -368,11 +410,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("ask_link_"):
-        if "priv_" in data and not has_tg_login():
-            await query.message.reply_text(
-                "🔒 <b>Private Download के लिए TG Login ज़रूरी है!</b>\nकृपया Render Environment में <code>API_ID</code>, <code>API_HASH</code> और <code>TG_SESSION</code> सेट करें।",
-                parse_mode="HTML",
-            )
+        if "priv_" in data and not await has_tg_login(user.id):
+            await _prompt_tg_login(query.message, user.id, next_action=data)
             return
         context.user_data["awaiting"] = data
         await query.message.reply_text("🔗 लिंक / विवरण भेजें:")
@@ -417,6 +456,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not awaiting:
         return
+
+    if awaiting == "tg_login_phone":
+        try:
+            state, reply_txt = await start_tg_phone_login(user.id, text)
+            if state == "code":
+                context.user_data["awaiting"] = "tg_login_otp"
+            else:
+                context.user_data["awaiting"] = None
+            await msg.reply_text(reply_txt, parse_mode="HTML")
+        except Exception as exc:
+            context.user_data["awaiting"] = None
+            await msg.reply_text(f"⚠️ Login त्रुटि: <code>{str(exc)[:180]}</code>", parse_mode="HTML")
+        return
+
+    if awaiting == "tg_login_otp":
+        try:
+            state, reply_txt = await submit_tg_otp_code(user.id, text)
+            if state == "2fa":
+                context.user_data["awaiting"] = "tg_login_2fa"
+                await msg.reply_text(reply_txt, parse_mode="HTML")
+            elif state == "logged_in":
+                next_act = context.user_data.pop("tg_next_action", None)
+                context.user_data["awaiting"] = next_act
+                await msg.reply_text(reply_txt, parse_mode="HTML")
+                if next_act:
+                    await msg.reply_text("🔗 अब Private लिंक / विवरण भेजें:")
+            else:
+                context.user_data["awaiting"] = None
+                await msg.reply_text(reply_txt, parse_mode="HTML")
+        except Exception as exc:
+            context.user_data["awaiting"] = None
+            await msg.reply_text(f"⚠️ OTP त्रुटि: <code>{str(exc)[:180]}</code>", parse_mode="HTML")
+        return
+
+    if awaiting == "tg_login_2fa":
+        try:
+            state, reply_txt = await submit_tg_2fa_password(user.id, text)
+            if state == "2fa":
+                await msg.reply_text(reply_txt, parse_mode="HTML")
+                return
+            next_act = context.user_data.pop("tg_next_action", None)
+            context.user_data["awaiting"] = next_act
+            await msg.reply_text(reply_txt, parse_mode="HTML")
+            if next_act:
+                await msg.reply_text("🔗 अब Private लिंक / विवरण भेजें:")
+        except Exception as exc:
+            context.user_data["awaiting"] = None
+            await msg.reply_text(f"⚠️ 2FA त्रुटि: <code>{str(exc)[:180]}</code>", parse_mode="HTML")
+        return
+
     context.user_data["awaiting"] = None
 
     if awaiting == "user_redeem_code":
