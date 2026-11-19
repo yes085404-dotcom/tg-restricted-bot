@@ -204,17 +204,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text("🛑 सभी चल रहे टास्क रोक दिए गए हैं।")
         return
     if data == "ad_verify":
+        if db.get_setting("ad_enabled", "1") != "1":
+            await query.message.reply_text("⚠️ Ad Verification अभी बंद है।")
+            return
         kb = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("🔗 Open AroLinks Ad", url=AROLINKS_URL)],
-                [InlineKeyboardButton("✅ Claim 3h Premium", callback_data="claim_ad_3h")],
             ]
         )
-        await query.message.reply_text("🎁 AroLinks स्टेप पूरा करें और <b>3 GHANTE TAK PREMIUM UNLOCK HUA</b> का लाभ लें:", parse_mode="HTML", reply_markup=kb)
-        return
-    if data == "claim_ad_3h":
-        until = db.grant_premium(user.id, float(AD_REWARD_HOURS), "ad", f"Ad Pass ({AD_REWARD_HOURS}h)")
-        await query.message.reply_text(f"✅ <b>3 GHANTE TAK PREMIUM UNLOCK HUA</b>\n⏳ शेष समय: <b>{format_remaining(until)}</b>", parse_mode="HTML")
+        await query.message.reply_text(
+            "🎁 <b>Ad Verification</b>\n\n"
+            "1. नीचे दिए गए <b>Open AroLinks Ad</b> बटन पर क्लिक करें।\n"
+            "2. AroLinks के सभी स्टेप्स पूरे करके <b>Get Link</b> दबाएँ।\n"
+            "3. Bot में वापस आते ही <b>3 GHANTE TAK PREMIUM UNLOCK HUA</b> का मैसेज आ जाएगा।",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
         return
     if data == "premium_plans":
         rows = [[InlineKeyboardButton(f"💎 {label}", callback_data=f"req_plan_{key}")] for key, label, _ in PLANS]
