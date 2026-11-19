@@ -6,7 +6,7 @@ import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import AuthKeyUnregisteredError, RPCError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
 
@@ -15,10 +15,14 @@ from config import API_HASH, API_ID, DB_PATH, DOWNLOAD_DIR, TG_SESSION
 ACTIVE_TASKS: Dict[int, Set[asyncio.Task]] = {}
 _CLIENTS: Dict[int, TelegramClient] = {}
 _PENDING_LOGINS: Dict[int, dict] = {}
+_DIALOGS_LOADED: Set[int] = set()
 _LOCK = asyncio.Lock()
 
 
 def _init_session_table() -> None:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -66,11 +70,14 @@ def _delete_session_db(user_id: int) -> None:
 
 
 def _safe_string_session(raw_str: str) -> Optional[StringSession]:
-    s = (raw_str or "").strip()
-    if not s:
+    s = (raw_str or "").strip().strip('"').strip("'")
+    if not s or len(s) < 20 or " " in s or "\n" in s or "import " in s:
         return None
     try:
-        return StringSession(s)
+        sess = StringSession(s)
+        if not getattr(sess, "auth_key", None):
+            return None
+        return sess
     except Exception:
         return None
 
@@ -111,6 +118,7 @@ async def start_tg_phone_login(user_id: int, phone: str) -> Tuple[str, str]:
 
     async with _LOCK:
         old = _CLIENTS.pop(user_id, None)
+        _DIALOGS_LOADED.discard(user_id)
         if old:
             try:
                 await old.disconnect()
@@ -147,6 +155,7 @@ async def submit_tg_otp_code(user_id: int, code: str) -> Tuple[str, str]:
     session_str = client.session.save()
     _save_session_db(user_id, session_str)
     _CLIENTS[user_id] = client
+    _DIALOGS_LOADED.discard(user_id)
     _PENDING_LOGINS.pop(user_id, None)
     return "logged_in", "✅ <b>Telegram Login सफल!</b> अब जब तक लॉगिन रहेगा, आप Private डाउनलोड कर सकते हैं।"
 
@@ -165,6 +174,7 @@ async def submit_tg_2fa_password(user_id: int, password: str) -> Tuple[str, str]
     session_str = client.session.save()
     _save_session_db(user_id, session_str)
     _CLIENTS[user_id] = client
+    _DIALOGS_LOADED.discard(user_id)
     _PENDING_LOGINS.pop(user_id, None)
     return "logged_in", "✅ <b>2FA के साथ Telegram Login सफल!</b> अब जब तक लॉगिन रहेगा, आप Private डाउनलोड कर सकते हैं।"
 
@@ -172,6 +182,7 @@ async def submit_tg_2fa_password(user_id: int, password: str) -> Tuple[str, str]
 async def logout_tg_user(user_id: int) -> None:
     async with _LOCK:
         _PENDING_LOGINS.pop(user_id, None)
+        _DIALOGS_LOADED.discard(user_id)
         client = _CLIENTS.pop(user_id, None)
         if client:
             try:
@@ -190,11 +201,17 @@ async def get_user_client(user_id: int) -> Optional[TelegramClient]:
     async with _LOCK:
         existing = _CLIENTS.get(user_id)
         if existing is not None:
-            if not existing.is_connected():
-                await existing.connect()
-            if await existing.is_user_authorized():
-                return existing
+            try:
+                if not existing.is_connected():
+                    await existing.connect()
+                if await existing.is_user_authorized():
+                    return existing
+            except AuthKeyUnregisteredError:
+                _delete_session_db(user_id)
+            except Exception:
+                pass
             _CLIENTS.pop(user_id, None)
+            _DIALOGS_LOADED.discard(user_id)
 
         saved_str = _load_session_db(user_id)
         sess = _safe_string_session(saved_str) if saved_str else None
@@ -204,13 +221,24 @@ async def get_user_client(user_id: int) -> Optional[TelegramClient]:
             return None
 
         client = TelegramClient(sess, API_ID, API_HASH)
-        await client.connect()
-        if not await client.is_user_authorized():
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                _delete_session_db(user_id)
+                return None
+        except AuthKeyUnregisteredError:
             try:
                 await client.disconnect()
             except Exception:
                 pass
             _delete_session_db(user_id)
+            return None
+        except Exception:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             return None
 
         _CLIENTS[user_id] = client
@@ -219,6 +247,26 @@ async def get_user_client(user_id: int) -> Optional[TelegramClient]:
 
 async def has_tg_login(user_id: int) -> bool:
     return (await get_user_client(user_id)) is not None
+
+
+async def _ensure_dialogs_registered(user_id: int, client: TelegramClient) -> None:
+    if user_id in _DIALOGS_LOADED:
+        return
+    try:
+        await client.get_dialogs(limit=100)
+        _DIALOGS_LOADED.add(user_id)
+    except Exception:
+        pass
+
+
+async def _resolve_tg_entity(user_id: int, client: TelegramClient, peer):
+    await _ensure_dialogs_registered(user_id, client)
+    try:
+        return await client.get_input_entity(peer)
+    except Exception:
+        _DIALOGS_LOADED.discard(user_id)
+        await _ensure_dialogs_registered(user_id, client)
+        return await client.get_input_entity(peer)
 
 
 def _apply_text_rules(text: str, settings: dict) -> str:
@@ -252,6 +300,11 @@ def _parse_single_link(link: str) -> Tuple[Optional[object], Optional[int], Opti
         peer = int(f"-100{m_priv.group(1)}")
         return peer, int(m_priv.group(2)), None
 
+    m_priv_channel_only = re.match(r"^https?://t\.me/c/(\d+)/?$", clean)
+    if m_priv_channel_only:
+        peer = int(f"-100{m_priv_channel_only.group(1)}")
+        return peer, 1, None
+
     m_pub_topic = re.match(r"^https?://t\.me/([A-Za-z0-9_]+)/(\d+)/(\d+)", clean)
     if m_pub_topic and m_pub_topic.group(1) != "c":
         return m_pub_topic.group(1), int(m_pub_topic.group(3)), int(m_pub_topic.group(2))
@@ -260,11 +313,24 @@ def _parse_single_link(link: str) -> Tuple[Optional[object], Optional[int], Opti
     if m_pub and m_pub.group(1) != "c":
         return m_pub.group(1), int(m_pub.group(2)), None
 
+    m_pub_channel_only = re.match(r"^https?://t\.me/([A-Za-z0-9_]+)/?$", clean)
+    if m_pub_channel_only and m_pub_channel_only.group(1) not in ("c", "joinchat"):
+        return m_pub_channel_only.group(1), 1, None
+
     return None, None, None
 
 
 def _build_message_ids(mode_key: str, raw_input: str, first_id: int) -> List[int]:
     txt = (raw_input or "").strip()
+
+    if "|" in txt and ("first_last_range" in mode_key or "range" in mode_key):
+        part1, part2 = txt.split("|", 1)
+        _, id1, _ = _parse_single_link(part1.strip())
+        _, id2, _ = _parse_single_link(part2.strip())
+        if id1 and id2:
+            start_i, end_i = min(id1, id2), max(id1, id2)
+            return list(range(start_i, min(end_i, start_i + 199) + 1))
+
     if mode_key == "ask_link_pub_custom":
         ids: List[int] = []
         for part in txt.split(","):
@@ -277,7 +343,8 @@ def _build_message_ids(mode_key: str, raw_input: str, first_id: int) -> List[int
                     ids.extend(range(a, b + step, step))
             elif part.isdigit():
                 ids.append(int(part))
-        return ids[:200]
+        if ids:
+            return ids[:200]
 
     if mode_key == "ask_link_priv_range":
         urls = re.findall(r"https?://t\.me/\S+", txt)
@@ -310,6 +377,48 @@ def _extract_video_dims(tg_msg) -> Tuple[Optional[int], Optional[int], Optional[
     return w, h, dur
 
 
+async def _send_media_with_settings(bot, dest_chat, file_path: str, caption_text: str, thumb_path: Optional[str], tg_msg=None) -> None:
+    send_kwargs = {"caption": caption_text or None}
+    has_thumb = bool(thumb_path and os.path.exists(thumb_path))
+    if has_thumb:
+        send_kwargs["thumbnail"] = open(thumb_path, "rb")
+
+    try:
+        if tg_msg is not None and getattr(tg_msg, "photo", None):
+            await bot.send_photo(chat_id=dest_chat, photo=open(file_path, "rb"), caption=caption_text or None)
+        elif tg_msg is not None and getattr(tg_msg, "video", None):
+            w, h, dur = _extract_video_dims(tg_msg)
+            v_kwargs = dict(send_kwargs)
+            if w:
+                v_kwargs["width"] = w
+            if h:
+                v_kwargs["height"] = h
+            if dur:
+                v_kwargs["duration"] = dur
+            v_kwargs["supports_streaming"] = True
+            await bot.send_video(chat_id=dest_chat, video=open(file_path, "rb"), **v_kwargs)
+        elif tg_msg is not None and getattr(tg_msg, "audio", None):
+            await bot.send_audio(chat_id=dest_chat, audio=open(file_path, "rb"), **send_kwargs)
+        elif tg_msg is not None and getattr(tg_msg, "voice", None):
+            await bot.send_voice(chat_id=dest_chat, voice=open(file_path, "rb"), caption=caption_text or None)
+        else:
+            lower = file_path.lower()
+            if lower.endswith((".mp4", ".mkv", ".mov", ".webm", ".avi")):
+                v_kwargs = dict(send_kwargs)
+                v_kwargs["supports_streaming"] = True
+                await bot.send_video(chat_id=dest_chat, video=open(file_path, "rb"), **v_kwargs)
+            elif lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                await bot.send_photo(chat_id=dest_chat, photo=open(file_path, "rb"), caption=caption_text or None)
+            else:
+                await bot.send_document(chat_id=dest_chat, document=open(file_path, "rb"), **send_kwargs)
+    finally:
+        if "thumbnail" in send_kwargs and hasattr(send_kwargs["thumbnail"], "close"):
+            try:
+                send_kwargs["thumbnail"].close()
+            except Exception:
+                pass
+
+
 async def process_download_request(bot, chat_id: int, user_id: int, mode_key: str, raw_input: str, settings: dict, status_msg) -> int:
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     first_url_match = re.search(r"https?://t\.me/\S+", raw_input or "")
@@ -336,9 +445,10 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
         dest_chat = int(raw_target) if raw_target.lstrip("-").isdigit() else raw_target
 
     thumb_path: Optional[str] = None
-    if settings.get("thumbnail_file_id"):
+    thumb_id = (settings.get("thumbnail_file_id") or "").strip()
+    if thumb_id:
         try:
-            t_file = await bot.get_file(settings["thumbnail_file_id"])
+            t_file = await bot.get_file(thumb_id)
             thumb_path = os.path.join(DOWNLOAD_DIR, f"thumb_{user_id}_{int(time.time())}.jpg")
             await t_file.download_to_drive(custom_path=thumb_path)
         except Exception:
@@ -363,9 +473,23 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
             try:
                 if is_private_peer and user_client is not None:
                     t0 = time.perf_counter()
-                    tg_msg = await user_client.get_messages(peer, ids=mid)
+                    entity = await _resolve_tg_entity(user_id, user_client, peer)
+                    try:
+                        tg_msg = await user_client.get_messages(entity, ids=mid)
+                    except AuthKeyUnregisteredError:
+                        _delete_session_db(user_id)
+                        _CLIENTS.pop(user_id, None)
+                        await status_msg.edit_text(
+                            "⚠️ <b>Telegram Session समाप्त हो गया है।</b>\nकृपया दोबारा TG Login करें।",
+                            parse_mode="HTML",
+                        )
+                        return delivered
+                    except RPCError:
+                        continue
+
                     if not tg_msg or not tg_msg.media:
                         continue
+
                     caption_text = _apply_text_rules(tg_msg.message or "", settings)
                     file_path = await user_client.download_media(tg_msg, file=os.path.join(DOWNLOAD_DIR, f"{user_id}_{mid}_"))
                     if not file_path or not os.path.exists(file_path):
@@ -383,34 +507,8 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                     except Exception:
                         pass
 
-                    send_kwargs = {"caption": caption_text or None}
-                    if thumb_path and os.path.exists(thumb_path):
-                        send_kwargs["thumbnail"] = open(thumb_path, "rb")
-
-                    try:
-                        if tg_msg.photo:
-                            await bot.send_photo(chat_id=dest_chat, photo=open(file_path, "rb"), **send_kwargs)
-                        elif tg_msg.video:
-                            w, h, dur = _extract_video_dims(tg_msg)
-                            v_kwargs = dict(send_kwargs)
-                            if w:
-                                v_kwargs["width"] = w
-                            if h:
-                                v_kwargs["height"] = h
-                            if dur:
-                                v_kwargs["duration"] = dur
-                            v_kwargs["supports_streaming"] = True
-                            await bot.send_video(chat_id=dest_chat, video=open(file_path, "rb"), **v_kwargs)
-                        elif tg_msg.audio:
-                            await bot.send_audio(chat_id=dest_chat, audio=open(file_path, "rb"), **send_kwargs)
-                        elif tg_msg.voice:
-                            await bot.send_voice(chat_id=dest_chat, voice=open(file_path, "rb"), caption=caption_text or None)
-                        else:
-                            await bot.send_document(chat_id=dest_chat, document=open(file_path, "rb"), **send_kwargs)
-                        delivered += 1
-                    finally:
-                        if "thumbnail" in send_kwargs and hasattr(send_kwargs["thumbnail"], "close"):
-                            send_kwargs["thumbnail"].close()
+                    await _send_media_with_settings(bot, dest_chat, file_path, caption_text, thumb_path, tg_msg=tg_msg)
+                    delivered += 1
                 else:
                     caption_text = _apply_text_rules("", settings)
                     copied_ok = False
@@ -431,26 +529,21 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                         if user_client is None:
                             user_client = await get_user_client(user_id)
                         if user_client is not None:
-                            tg_msg = await user_client.get_messages(peer, ids=mid)
+                            try:
+                                entity = await _resolve_tg_entity(user_id, user_client, peer)
+                                tg_msg = await user_client.get_messages(entity, ids=mid)
+                            except AuthKeyUnregisteredError:
+                                _delete_session_db(user_id)
+                                _CLIENTS.pop(user_id, None)
+                                tg_msg = None
+                            except Exception:
+                                tg_msg = None
+
                             if tg_msg and tg_msg.media:
                                 caption_text = _apply_text_rules(tg_msg.message or "", settings)
                                 file_path = await user_client.download_media(tg_msg, file=os.path.join(DOWNLOAD_DIR, f"{user_id}_{mid}_"))
                                 if file_path and os.path.exists(file_path):
-                                    if tg_msg.video:
-                                        w, h, dur = _extract_video_dims(tg_msg)
-                                        await bot.send_video(
-                                            chat_id=dest_chat,
-                                            video=open(file_path, "rb"),
-                                            width=w,
-                                            height=h,
-                                            duration=dur,
-                                            supports_streaming=True,
-                                            caption=caption_text or None,
-                                        )
-                                    elif tg_msg.photo:
-                                        await bot.send_photo(chat_id=dest_chat, photo=open(file_path, "rb"), caption=caption_text or None)
-                                    else:
-                                        await bot.send_document(chat_id=dest_chat, document=open(file_path, "rb"), caption=caption_text or None)
+                                    await _send_media_with_settings(bot, dest_chat, file_path, caption_text, thumb_path, tg_msg=tg_msg)
                                     delivered += 1
             finally:
                 if file_path and os.path.exists(file_path):
