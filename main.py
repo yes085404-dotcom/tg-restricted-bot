@@ -256,6 +256,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "stop_tasks":
         context.user_data["awaiting"] = None
         context.user_data["tg_next_action"] = None
+        context.user_data.pop("first_range_link", None)
         stopped = cancel_user_tasks(user.id)
         await query.message.reply_text(f"🛑 चल रहे टास्क रोक दिए गए हैं ({stopped} cancelled)।")
         return
@@ -347,6 +348,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "set_reset":
         db.reset_user_settings(user.id)
+        db.update_user_setting(user.id, "thumbnail_file_id", "")
+        db.update_user_setting(user.id, "target_chat_id", "")
+        db.update_user_setting(user.id, "rename_tag", "")
+        db.update_user_setting(user.id, "custom_caption", "")
+        db.update_user_setting(user.id, "replace_words_json", "[]")
+        db.update_user_setting(user.id, "delete_words_json", "[]")
         await show_custom_settings(update, user.id)
         return
 
@@ -389,6 +396,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 [
                     [InlineKeyboardButton("📂 All Media Download", callback_data="ask_link_pub_all")],
                     [InlineKeyboardButton("🔢 Custom (1,5,8 / 1-50)", callback_data="ask_link_pub_custom")],
+                    [InlineKeyboardButton("🔗 Link Download", callback_data="ask_link_pub_link")],
+                    [InlineKeyboardButton("↔️ First and Last Link", callback_data="ask_link_pub_first_last")],
                     [InlineKeyboardButton("🧵 Group Topic Download", callback_data="ask_link_pub_topic")],
                 ]
             ),
@@ -403,7 +412,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 [
                     [InlineKeyboardButton("🧵 Group Topic Download", callback_data="ask_link_priv_topic")],
                     [InlineKeyboardButton("🔗 Link Download", callback_data="ask_link_priv_link")],
-                    [InlineKeyboardButton("↔️ First and Last Link", callback_data="ask_link_priv_range")],
+                    [InlineKeyboardButton("↔️ First and Last Link", callback_data="ask_link_priv_first_last")],
                 ]
             ),
         )
@@ -412,6 +421,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("ask_link_"):
         if "priv_" in data and not await has_tg_login(user.id):
             await _prompt_tg_login(query.message, user.id, next_action=data)
+            return
+        if "first_last" in data or "range" in data:
+            context.user_data.pop("first_range_link", None)
+            context.user_data["range_mode_key"] = data
+            context.user_data["awaiting"] = "await_first_link"
+            await query.message.reply_text("1️⃣ कृपया <b>पहले मीडिया का लिंक</b> भेजें:", parse_mode="HTML")
             return
         context.user_data["awaiting"] = data
         await query.message.reply_text("🔗 लिंक / विवरण भेजें:")
@@ -448,11 +463,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     awaiting = context.user_data.get("awaiting")
     text = (msg.text or "").strip()
 
-    if awaiting == "set_thumbnail" and msg.photo:
-        db.update_user_setting(user.id, "thumbnail_file_id", msg.photo[-1].file_id)
-        context.user_data["awaiting"] = None
-        await show_custom_settings(update, user.id)
-        return
+    if awaiting == "set_thumbnail":
+        if msg.photo:
+            db.update_user_setting(user.id, "thumbnail_file_id", msg.photo[-1].file_id)
+            context.user_data["awaiting"] = None
+            await show_custom_settings(update, user.id)
+            return
+        if text.lower() == "clear":
+            db.update_user_setting(user.id, "thumbnail_file_id", "")
+            context.user_data["awaiting"] = None
+            await show_custom_settings(update, user.id)
+            return
 
     if not awaiting:
         return
@@ -478,10 +499,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await msg.reply_text(reply_txt, parse_mode="HTML")
             elif state == "logged_in":
                 next_act = context.user_data.pop("tg_next_action", None)
-                context.user_data["awaiting"] = next_act
-                await msg.reply_text(reply_txt, parse_mode="HTML")
-                if next_act:
-                    await msg.reply_text("🔗 अब Private लिंक / विवरण भेजें:")
+                if next_act and ("first_last" in next_act or "range" in next_act):
+                    context.user_data.pop("first_range_link", None)
+                    context.user_data["range_mode_key"] = next_act
+                    context.user_data["awaiting"] = "await_first_link"
+                    await msg.reply_text(reply_txt, parse_mode="HTML")
+                    await msg.reply_text("1️⃣ कृपया <b>पहले मीडिया का लिंक</b> भेजें:", parse_mode="HTML")
+                else:
+                    context.user_data["awaiting"] = next_act
+                    await msg.reply_text(reply_txt, parse_mode="HTML")
+                    if next_act:
+                        await msg.reply_text("🔗 अब Private लिंक / विवरण भेजें:")
             else:
                 context.user_data["awaiting"] = None
                 await msg.reply_text(reply_txt, parse_mode="HTML")
@@ -497,16 +525,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await msg.reply_text(reply_txt, parse_mode="HTML")
                 return
             next_act = context.user_data.pop("tg_next_action", None)
-            context.user_data["awaiting"] = next_act
-            await msg.reply_text(reply_txt, parse_mode="HTML")
-            if next_act:
-                await msg.reply_text("🔗 अब Private लिंक / विवरण भेजें:")
+            if next_act and ("first_last" in next_act or "range" in next_act):
+                context.user_data.pop("first_range_link", None)
+                context.user_data["range_mode_key"] = next_act
+                context.user_data["awaiting"] = "await_first_link"
+                await msg.reply_text(reply_txt, parse_mode="HTML")
+                await msg.reply_text("1️⃣ कृपया <b>पहले मीडिया का लिंक</b> भेजें:", parse_mode="HTML")
+            else:
+                context.user_data["awaiting"] = next_act
+                await msg.reply_text(reply_txt, parse_mode="HTML")
+                if next_act:
+                    await msg.reply_text("🔗 अब Private लिंक / विवरण भेजें:")
         except Exception as exc:
             context.user_data["awaiting"] = None
             await msg.reply_text(f"⚠️ 2FA त्रुटि: <code>{str(exc)[:180]}</code>", parse_mode="HTML")
         return
 
-    context.user_data["awaiting"] = None
+    if awaiting == "await_first_link":
+        context.user_data["first_range_link"] = text
+        context.user_data["awaiting"] = "await_last_link"
+        await msg.reply_text("2️⃣ अब <b>अंतिम मीडिया का लिंक</b> भेजें:", parse_mode="HTML")
+        return
+
+    if awaiting == "await_last_link":
+        first_link = context.user_data.pop("first_range_link", "")
+        range_key = context.user_data.pop("range_mode_key", "first_last_range")
+        context.user_data["awaiting"] = None
+        combined = f"{first_link}|{text}"
+        awaiting = range_key
+        text = combined
+    else:
+        context.user_data["awaiting"] = None
 
     if awaiting == "user_redeem_code":
         ok, code_err, hrs = db.redeem_code(user.id, text)
