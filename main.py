@@ -348,12 +348,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "set_reset":
         db.reset_user_settings(user.id)
-        db.update_user_setting(user.id, "thumbnail_file_id", "")
-        db.update_user_setting(user.id, "target_chat_id", "")
-        db.update_user_setting(user.id, "rename_tag", "")
-        db.update_user_setting(user.id, "custom_caption", "")
-        db.update_user_setting(user.id, "replace_words_json", "[]")
-        db.update_user_setting(user.id, "delete_words_json", "[]")
         await show_custom_settings(update, user.id)
         return
 
@@ -611,7 +605,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     pmsg = await msg.reply_text(
-        "⏳ <b>Live Status</b>\n⬇️ Download: <b>25%</b> | Speed: <b>5.0 MB/s</b> | ETA: <b>1s</b>\n⬆️ Upload: <b>0%</b> | Speed: <b>0.0 MB/s</b> | ETA: <b>--</b>",
+        "📊 <b>LIVE TRANSFER DASHBOARD</b>\n📁 <b>Files:</b> Starting...\n🔄 <b>Status:</b> <code>Initializing</code>",
         parse_mode="HTML",
     )
     job = asyncio.create_task(_run_download_job(context.bot, msg.chat_id, user.id, awaiting, text, mode_type, pmsg))
