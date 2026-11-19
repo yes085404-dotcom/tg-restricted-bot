@@ -1,18 +1,78 @@
 import asyncio
 import os
 import re
+import sqlite3
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
 
-from config import API_HASH, API_ID, DOWNLOAD_DIR, TG_SESSION
+from config import API_HASH, API_ID, DB_PATH, DOWNLOAD_DIR, TG_SESSION
 
 ACTIVE_TASKS: Dict[int, Set[asyncio.Task]] = {}
-_USER_CLIENT: Optional[TelegramClient] = None
-_CLIENT_LOCK = asyncio.Lock()
+_CLIENTS: Dict[int, TelegramClient] = {}
+_PENDING_LOGINS: Dict[int, dict] = {}
+_LOCK = asyncio.Lock()
+
+
+def _init_session_table() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tg_user_sessions (
+                user_id INTEGER PRIMARY KEY,
+                session_str TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _save_session_db(user_id: int, session_str: str) -> None:
+    _init_session_table()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO tg_user_sessions (user_id, session_str, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                session_str = excluded.session_str,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, session_str, time.time()),
+        )
+        conn.commit()
+
+
+def _load_session_db(user_id: int) -> str:
+    _init_session_table()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT session_str FROM tg_user_sessions WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return (row[0] if row and row[0] else "").strip()
+
+
+def _delete_session_db(user_id: int) -> None:
+    _init_session_table()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM tg_user_sessions WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def _safe_string_session(raw_str: str) -> Optional[StringSession]:
+    s = (raw_str or "").strip()
+    if not s:
+        return None
+    try:
+        return StringSession(s)
+    except Exception:
+        return None
 
 
 def register_user_task(user_id: int, task: asyncio.Task) -> None:
@@ -38,22 +98,127 @@ def cancel_user_tasks(user_id: int) -> int:
     return cancelled
 
 
-def has_tg_login() -> bool:
-    return bool(API_ID and API_HASH and TG_SESSION)
+def has_api_creds() -> bool:
+    return bool(API_ID and API_HASH)
 
 
-async def get_user_client() -> Optional[TelegramClient]:
-    global _USER_CLIENT
-    if not has_tg_login():
+async def start_tg_phone_login(user_id: int, phone: str) -> Tuple[str, str]:
+    if not has_api_creds():
+        return "error", "❌ Render Environment में <b>API_ID</b> और <b>API_HASH</b> सेट करें।"
+    clean_phone = re.sub(r"[^\d+]", "", (phone or "").strip())
+    if len(re.sub(r"\D", "", clean_phone)) < 6:
+        return "error", "❌ मान्य फ़ोन नंबर भेजें (जैसे <code>+919876543210</code>)।"
+
+    async with _LOCK:
+        old = _CLIENTS.pop(user_id, None)
+        if old:
+            try:
+                await old.disconnect()
+            except Exception:
+                pass
+        _PENDING_LOGINS.pop(user_id, None)
+
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+        sent = await client.send_code_request(clean_phone)
+        _PENDING_LOGINS[user_id] = {
+            "client": client,
+            "phone": clean_phone,
+            "phone_code_hash": sent.phone_code_hash,
+        }
+        return "code", "📩 आपके Telegram पर OTP कोड भेजा गया है। कृपया <b>OTP</b> भेजें:"
+
+
+async def submit_tg_otp_code(user_id: int, code: str) -> Tuple[str, str]:
+    pending = _PENDING_LOGINS.get(user_id)
+    if not pending:
+        return "error", "⚠️ लॉगिन सेशन नहीं मिला। कृपया दोबारा TG Login शुरू करें।"
+
+    clean_code = re.sub(r"\s+", "", (code or "").strip())
+    client: TelegramClient = pending["client"]
+    phone: str = pending["phone"]
+    code_hash: str = pending["phone_code_hash"]
+
+    try:
+        await client.sign_in(phone=phone, code=clean_code, phone_code_hash=code_hash)
+    except SessionPasswordNeededError:
+        return "2fa", "🔐 आपके अकाउंट पर <b>2-Step Verification (2FA)</b> लगा है। कृपया अपना <b>2FA Password</b> भेजें:"
+
+    session_str = client.session.save()
+    _save_session_db(user_id, session_str)
+    _CLIENTS[user_id] = client
+    _PENDING_LOGINS.pop(user_id, None)
+    return "logged_in", "✅ <b>Telegram Login सफल!</b> अब जब तक लॉगिन रहेगा, आप Private डाउनलोड कर सकते हैं।"
+
+
+async def submit_tg_2fa_password(user_id: int, password: str) -> Tuple[str, str]:
+    pending = _PENDING_LOGINS.get(user_id)
+    if not pending:
+        return "error", "⚠️ लॉगिन सेशन नहीं मिला। कृपया दोबारा TG Login शुरू करें।"
+
+    pwd = (password or "").strip()
+    if not pwd:
+        return "2fa", "❌ पासवर्ड खाली नहीं हो सकता। कृपया <b>2FA Password</b> भेजें:"
+
+    client: TelegramClient = pending["client"]
+    await client.sign_in(password=pwd)
+    session_str = client.session.save()
+    _save_session_db(user_id, session_str)
+    _CLIENTS[user_id] = client
+    _PENDING_LOGINS.pop(user_id, None)
+    return "logged_in", "✅ <b>2FA के साथ Telegram Login सफल!</b> अब जब तक लॉगिन रहेगा, आप Private डाउनलोड कर सकते हैं।"
+
+
+async def logout_tg_user(user_id: int) -> None:
+    async with _LOCK:
+        _PENDING_LOGINS.pop(user_id, None)
+        client = _CLIENTS.pop(user_id, None)
+        if client:
+            try:
+                await client.log_out()
+            except Exception:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+    _delete_session_db(user_id)
+
+
+async def get_user_client(user_id: int) -> Optional[TelegramClient]:
+    if not has_api_creds():
         return None
-    async with _CLIENT_LOCK:
-        if _USER_CLIENT is None:
-            _USER_CLIENT = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
-        if not _USER_CLIENT.is_connected():
-            await _USER_CLIENT.connect()
-        if not await _USER_CLIENT.is_user_authorized():
+    async with _LOCK:
+        existing = _CLIENTS.get(user_id)
+        if existing is not None:
+            if not existing.is_connected():
+                await existing.connect()
+            if await existing.is_user_authorized():
+                return existing
+            _CLIENTS.pop(user_id, None)
+
+        saved_str = _load_session_db(user_id)
+        sess = _safe_string_session(saved_str) if saved_str else None
+        if sess is None and TG_SESSION:
+            sess = _safe_string_session(TG_SESSION)
+        if sess is None:
             return None
-        return _USER_CLIENT
+
+        client = TelegramClient(sess, API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            _delete_session_db(user_id)
+            return None
+
+        _CLIENTS[user_id] = client
+        return client
+
+
+async def has_tg_login(user_id: int) -> bool:
+    return (await get_user_client(user_id)) is not None
 
 
 def _apply_text_rules(text: str, settings: dict) -> str:
@@ -156,22 +321,15 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
         return 0
 
     is_private_peer = isinstance(peer, int)
-    if is_private_peer and not has_tg_login():
+    user_client = await get_user_client(user_id) if is_private_peer else None
+    if is_private_peer and user_client is None:
         await status_msg.edit_text(
-            "🔒 <b>Private Download के लिए TG Login ज़रूरी है!</b>\nकृपया Render Environment में <code>API_ID</code>, <code>API_HASH</code> और <code>TG_SESSION</code> सेट करें।",
+            "🔒 <b>Private Download के लिए पहले Telegram Login करें!</b>\n<b>Private (TG Login)</b> बटन दबाकर अपना फ़ोन नंबर और OTP (तथा 2FA यदि हो) दर्ज करें।",
             parse_mode="HTML",
         )
         return 0
 
     msg_ids = _build_message_ids(mode_key, raw_input, base_msg_id)
-    user_client = await get_user_client() if is_private_peer else None
-    if is_private_peer and user_client is None:
-        await status_msg.edit_text(
-            "⚠️ <b>TG Login Session अमान्य या एक्सपायर है।</b>\nकृपया सही <code>TG_SESSION</code> सेट करें।",
-            parse_mode="HTML",
-        )
-        return 0
-
     dest_chat = chat_id
     raw_target = (settings.get("target_chat_id") or "").strip()
     if raw_target:
@@ -269,9 +427,9 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
                     except Exception:
                         copied_ok = False
 
-                    if not copied_ok and has_tg_login():
+                    if not copied_ok:
                         if user_client is None:
-                            user_client = await get_user_client()
+                            user_client = await get_user_client(user_id)
                         if user_client is not None:
                             tg_msg = await user_client.get_messages(peer, ids=mid)
                             if tg_msg and tg_msg.media:
@@ -308,7 +466,7 @@ async def process_download_request(bot, chat_id: int, user_id: int, mode_key: st
             )
         else:
             await status_msg.edit_text(
-                "⚠️ <b>कोई मीडिया/वीडियो नहीं भेजा जा सका।</b>\nजाँचें कि लिंक सही है, वीडियो मौजूद है, या Bot/TG Login की उस चैनल तक पहुँच है।",
+                "⚠️ <b>कोई मीडिया/वीडियो नहीं भेजा जा सका।</b>\nजाँचें कि लिंक सही है, वीडियो मौजूद है, या लॉगिन किए हुए Telegram अकाउंट की उस चैनल तक पहुँच है।",
                 parse_mode="HTML",
             )
         return delivered
