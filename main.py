@@ -29,6 +29,7 @@ from config import (
     PORT,
 )
 from database import Database
+from downloader import cancel_user_tasks, has_tg_login, process_download_request, register_user_task
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("tg_restricted_bot")
@@ -83,17 +84,23 @@ def custom_settings_keyboard() -> InlineKeyboardMarkup:
 async def check_force_join(bot, user_id: int) -> list[dict]:
     if db.get_setting("force_join_enabled", "1") != "1" or db.is_admin(user_id, OWNER_ID):
         return []
-    missing = []
-    for ch in db.get_force_chats():
+    chats = db.get_force_chats()
+    if not chats:
+        return []
+
+    async def _one_check(ch: dict) -> dict | None:
         cid = ch["chat_id"]
         try:
             target = int(cid) if cid.lstrip("-").isdigit() else cid
-            member = await bot.get_chat_member(target, user_id)
+            member = await asyncio.wait_for(bot.get_chat_member(target, user_id), timeout=3.0)
             if member.status in ("left", "kicked"):
-                missing.append(ch)
+                return ch
+            return None
         except Exception:
-            missing.append(ch)
-    return missing
+            return ch
+
+    results = await asyncio.gather(*[_one_check(c) for c in chats], return_exceptions=False)
+    return [r for r in results if r is not None]
 
 
 async def send_force_join_prompt(update: Update, missing: list[dict]) -> None:
@@ -104,7 +111,7 @@ async def send_force_join_prompt(update: Update, missing: list[dict]) -> None:
             buttons.append([InlineKeyboardButton(f"➕ Join {ch.get('title') or ch['chat_id']}", url=url)])
     buttons.append([InlineKeyboardButton("✅ Verify", callback_data="verify_join")])
     txt = "🔒 <b>सभी Channel / Group में Join करें और नीचे Verify दबाएँ:</b>"
-    if update.callback_query:
+    if update.callback_query and update.callback_query.message:
         await update.callback_query.message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
     elif update.message:
         await update.message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
@@ -123,8 +130,8 @@ async def show_custom_settings(update: Update, user_id: int) -> None:
         f"🔄 <b>रिप्लेस वर्ड्स:</b> {', '.join([f'{a}->{b}' for a, b in rep]) if rep else '❌ कोई नहीं'}\n"
         f"🗑️ <b>डिलीट वर्ड्स:</b> {', '.join(dlt) if dlt else '❌ कोई नहीं'}"
     )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(txt, parse_mode="HTML", reply_markup=custom_settings_keyboard())
+    if update.callback_query and update.callback_query.message:
+        await update.callback_query.message.edit_text(txt, parse_mode="HTML", reply_markup=custom_settings_keyboard())
     elif update.message:
         await update.message.reply_text(txt, parse_mode="HTML", reply_markup=custom_settings_keyboard())
 
@@ -165,53 +172,57 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user = update.effective_user
-    if not query or not user:
-        return
-    u = db.ensure_user(user.id, user.username or "", user.full_name or "")
-    if u.get("is_banned"):
-        await query.answer("Banned", show_alert=True)
-        return
-    if await handle_admin_callback(update, context, db, OWNER_ID):
+    if not query or not user or not query.message:
         return
 
     data = query.data or ""
-    await query.answer()
+    # सबसे पहले callback query को तुरंत acknowledge करें ताकि बटन दबाते ही UI fast लगे
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    u = db.ensure_user(user.id, user.username or "", user.full_name or "")
+    if u.get("is_banned"):
+        await query.message.reply_text(f"🚫 Banned: {u.get('ban_reason') or 'N/A'}")
+        return
+
+    if await handle_admin_callback(update, context, db, OWNER_ID):
+        return
 
     if data == "verify_join":
-        if await check_force_join(context.bot, user.id):
+        missing = await check_force_join(context.bot, user.id)
+        if missing:
             await query.message.reply_text("⚠️ अभी भी कुछ Channel/Group में Join होना बाकी है।")
             return
         await query.message.reply_text("✅ वेरिफ़िकेशन सफल!", reply_markup=main_menu_keyboard(user.id, u.get("lang", "hi")))
         return
 
-    if await check_force_join(context.bot, user.id):
-        await send_force_join_prompt(update, await check_force_join(context.bot, user.id))
-        return
-
     if data == "admin_login" and db.is_admin(user.id, OWNER_ID):
         await open_admin_panel(update, context, db, OWNER_ID)
         return
+
     if data == "back_main":
         await query.message.edit_text("🏠 <b>Main Dashboard</b>", parse_mode="HTML", reply_markup=main_menu_keyboard(user.id, u.get("lang", "hi")))
         return
+
     if data == "toggle_lang":
         new_lang = "en" if u.get("lang") == "hi" else "hi"
         db.set_lang(user.id, new_lang)
         await query.message.edit_text(f"🌐 Language: <b>{new_lang.upper()}</b>", parse_mode="HTML", reply_markup=main_menu_keyboard(user.id, new_lang))
         return
+
     if data == "stop_tasks":
         context.user_data["awaiting"] = None
-        await query.message.reply_text("🛑 सभी चल रहे टास्क रोक दिए गए हैं।")
+        stopped = cancel_user_tasks(user.id)
+        await query.message.reply_text(f"🛑 चल रहे टास्क रोक दिए गए हैं ({stopped} cancelled)।")
         return
+
     if data == "ad_verify":
         if db.get_setting("ad_enabled", "1") != "1":
             await query.message.reply_text("⚠️ Ad Verification अभी बंद है।")
             return
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🔗 Open AroLinks Ad", url=AROLINKS_URL)],
-            ]
-        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open AroLinks Ad", url=AROLINKS_URL)]])
         await query.message.reply_text(
             "🎁 <b>Ad Verification</b>\n\n"
             "1. नीचे दिए गए <b>Open AroLinks Ad</b> बटन पर क्लिक करें।\n"
@@ -221,11 +232,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             reply_markup=kb,
         )
         return
+
     if data == "premium_plans":
         rows = [[InlineKeyboardButton(f"💎 {label}", callback_data=f"req_plan_{key}")] for key, label, _ in PLANS]
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_main")])
         await query.message.edit_text("💎 <b>Premium Plans</b> चुनें:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
+
     if data.startswith("req_plan_"):
         key = data.replace("req_plan_", "", 1)
         m = next((p for p in PLANS if p[0] == key), None)
@@ -233,15 +246,21 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             req_id = db.create_plan_request(user.id, user.username or "", key, m[1])
             if OWNER_ID:
                 try:
-                    await context.bot.send_message(OWNER_ID, f"📩 Request #{req_id} | ID: <code>{user.id}</code> | @{user.username or 'N/A'} | <b>{m[1]}</b>", parse_mode="HTML")
+                    await context.bot.send_message(
+                        OWNER_ID,
+                        f"📩 Request #{req_id} | ID: <code>{user.id}</code> | @{user.username or 'N/A'} | <b>{m[1]}</b>",
+                        parse_mode="HTML",
+                    )
                 except Exception:
                     pass
             await query.message.reply_text(f"✅ प्लान अनुरोध (<b>{m[1]}</b>) Admin को भेज दिया गया है।", parse_mode="HTML")
         return
+
     if data == "redeem_code":
         context.user_data["awaiting"] = "user_redeem_code"
         await query.message.reply_text("🎟️ Redeem Code भेजें:")
         return
+
     if data == "my_limits":
         fresh = db.get_user(user.id) or {}
         prem_until = float(fresh.get("premium_until") or 0)
@@ -252,21 +271,25 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             txt = f"🆓 <b>Free Plan</b> ({FREE_LIFETIME_LIMIT} Lifetime)\n📥 इस्तेमाल: {used}/{FREE_LIFETIME_LIMIT} | बाकी: <b>{max(0, FREE_LIFETIME_LIMIT - used)}</b>"
         await query.message.reply_text(f"📊 <b>MY LIMITS</b>\n\n{txt}", parse_mode="HTML")
         return
+
     if data == "speed_test":
         t0 = time.perf_counter()
         await context.bot.get_me()
         ms = (time.perf_counter() - t0) * 1000.0
         await query.message.reply_text(f"⚡ <b>Speed Test</b>\nPing: <b>{ms:.1f} ms</b> | Status: <b>Online</b>", parse_mode="HTML")
         return
+
     if data == "help_guide":
         await query.message.reply_text(
             "📖 <b>Help & Guide</b>\n• Free Lifetime Limit: <b>10 Files</b>\n• Ad Verification: <b>3 Hours</b> Premium\n• Custom Settings से Target Chat, Thumbnail, Rename Tag, Caption, Replace/Delete Words सेट करें।",
             parse_mode="HTML",
         )
         return
+
     if data == "custom_settings":
         await show_custom_settings(update, user.id)
         return
+
     set_prompts = {
         "set_target": ("set_target_chat_id", "🎯 Target Chat ID / `@username` या `clear` भेजें:"),
         "set_thumb": ("set_thumbnail", "🖼️ Thumbnail फोटो या `clear` भेजें:"),
@@ -279,20 +302,27 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["awaiting"], prompt_txt = set_prompts[data]
         await query.message.reply_text(prompt_txt, parse_mode="Markdown")
         return
+
     if data == "set_reset":
         db.reset_user_settings(user.id)
         await show_custom_settings(update, user.id)
         return
+
     if data in ("mode_single", "mode_batch", "mode_topics"):
         ok, _ = db.can_download(user.id)
         if not ok:
-            await query.message.reply_text(f"⚠️ आपकी <b>{FREE_LIFETIME_LIMIT} फ़ाइल्स</b> की फ्री सीमा समाप्त हो गई है। Ad Verification या Premium लें।", parse_mode="HTML")
+            await query.message.reply_text(
+                f"⚠️ आपकी <b>{FREE_LIFETIME_LIMIT} फ़ाइल्स</b> की फ्री सीमा समाप्त हो गई है। Ad Verification या Premium लें।",
+                parse_mode="HTML",
+            )
             return
         if data == "mode_single":
             await query.message.reply_text(
                 "📥 <b>Single Media</b> चुनें:",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Public", callback_data="ask_link_pub_single"), InlineKeyboardButton("🔒 Private (TG Login)", callback_data="ask_link_priv_single")]]),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🌐 Public", callback_data="ask_link_pub_single"), InlineKeyboardButton("🔒 Private (TG Login)", callback_data="ask_link_priv_single")]]
+                ),
             )
         elif data == "mode_batch":
             await query.message.reply_text(
@@ -308,6 +338,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context.user_data["awaiting"] = "ask_link_topic"
             await query.message.reply_text("🧵 Group Topic लिंक भेजें:")
         return
+
     if data == "pub_batch_opts":
         await query.message.reply_text(
             "🌐 <b>Public Batch</b>:",
@@ -321,6 +352,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
         return
+
     if data == "priv_batch_opts":
         await query.message.reply_text(
             "🔒 <b>Private Batch (TG Login)</b>:",
@@ -334,10 +366,36 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
         return
+
     if data.startswith("ask_link_"):
+        if "priv_" in data and not has_tg_login():
+            await query.message.reply_text(
+                "🔒 <b>Private Download के लिए TG Login ज़रूरी है!</b>\nकृपया Render Environment में <code>API_ID</code>, <code>API_HASH</code> और <code>TG_SESSION</code> सेट करें।",
+                parse_mode="HTML",
+            )
+            return
         context.user_data["awaiting"] = data
         await query.message.reply_text("🔗 लिंक / विवरण भेजें:")
         return
+
+
+async def _run_download_job(bot, chat_id: int, user_id: int, awaiting_mode: str, text: str, mode_type: str, pmsg) -> None:
+    try:
+        settings = db.get_user_settings(user_id)
+        delivered = await process_download_request(bot, chat_id, user_id, awaiting_mode, text, settings, pmsg)
+        if delivered > 0 and mode_type == "free":
+            db.increment_free_usage(user_id, delivered)
+    except asyncio.CancelledError:
+        try:
+            await pmsg.edit_text("🛑 टास्क रोक दिया गया।")
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.exception("Download job failed: %s", exc)
+        try:
+            await pmsg.edit_text(f"⚠️ डाउनलोड में त्रुटि आई: <code>{str(exc)[:180]}</code>", parse_mode="HTML")
+        except Exception:
+            pass
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -365,7 +423,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ok, code_err, hrs = db.redeem_code(user.id, text)
         if ok:
             fresh = db.get_user(user.id) or {}
-            await msg.reply_text(f"🎉 Redeem सफल! <b>{hrs}h</b> Premium चालू।\n⏳ बाकी समय: <b>{format_remaining(float(fresh.get('premium_until') or 0))}</b>", parse_mode="HTML")
+            await msg.reply_text(
+                f"🎉 Redeem सफल! <b>{hrs}h</b> Premium चालू।\n⏳ बाकी समय: <b>{format_remaining(float(fresh.get('premium_until') or 0))}</b>",
+                parse_mode="HTML",
+            )
         else:
             await msg.reply_text(f"❌ Code अमान्य/समाप्त (`{code_err}`)", parse_mode="Markdown")
         return
@@ -412,13 +473,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     pmsg = await msg.reply_text(
-        "⏳ <b>Live Status</b>\n⬇️ Download: <b>40%</b> | Speed: <b>4.5 MB/s</b> | ETA: <b>3s</b>\n⬆️ Upload: <b>25%</b> | Speed: <b>4.0 MB/s</b> | ETA: <b>4s</b>",
+        "⏳ <b>Live Status</b>\n⬇️ Download: <b>25%</b> | Speed: <b>5.0 MB/s</b> | ETA: <b>1s</b>\n⬆️ Upload: <b>0%</b> | Speed: <b>0.0 MB/s</b> | ETA: <b>--</b>",
         parse_mode="HTML",
     )
-    await asyncio.sleep(0.5)
-    await pmsg.edit_text(f"✅ <b>Ready</b>\n📥 Input: <code>{text[:120]}</code>", parse_mode="HTML")
-    if mode_type == "free":
-        db.increment_free_usage(user.id, 1)
+    job = asyncio.create_task(_run_download_job(context.bot, msg.chat_id, user.id, awaiting, text, mode_type, pmsg))
+    register_user_task(user.id, job)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -438,7 +497,7 @@ async def main_loop() -> None:
     backoff = 2
     try:
         while True:
-            app = Application.builder().token(BOT_TOKEN).build()
+            app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
             app.add_handler(CommandHandler("start", start_cmd))
             app.add_handler(CallbackQueryHandler(callback_router))
             app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
